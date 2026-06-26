@@ -6,7 +6,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function launchBrowser() {
   return await chromium.launch({
@@ -33,27 +33,33 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// ─── LinkedIn Scraper ────────────────────────────────────────────────────────
+// ─── LinkedIn Scraper ─────────────────────────────────────────────────────────
+// FIX: Removed per-job page open for description — was causing 5min timeout
+// Description is now built from card data only (fast)
 
 async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
     const query = encodeURIComponent(role);
-    const loc = encodeURIComponent(location);
-    const url = `https://www.linkedin.com/jobs/search/?keywords=${query}&location=${loc}&f_TPR=r86400&f_E=2%2C3&sortBy=DD`;
+    const loc   = encodeURIComponent(location);
+    const url   = `https://www.linkedin.com/jobs/search/?keywords=${query}&location=${loc}&f_TPR=r86400&f_E=2%2C3&sortBy=DD`;
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2000);
+    await sleep(1500);
 
-    // Accept cookies if prompted
     try {
       await page.click('button[action-type="ACCEPT"]', { timeout: 3000 });
-      await sleep(1000);
+      await sleep(500);
     } catch (_) {}
 
-    await page.waitForSelector('.jobs-search__results-list, .job-card-container', { timeout: 15000 });
+    await page.waitForSelector(
+      '.jobs-search__results-list, .job-card-container, .base-card',
+      { timeout: 15000 }
+    ).catch(() => {});
 
     const cards = await page.$$('.job-card-container, .base-card');
+    console.log(`LinkedIn: found ${cards.length} cards for "${role}" in "${location}"`);
+
     for (const card of cards.slice(0, maxJobs)) {
       try {
         const title = await card.$eval(
@@ -79,18 +85,8 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
         ).catch(() => null);
         if (!jobUrl) continue;
 
-        // Get description by visiting the job page
-        let description = `${role} position at ${company} in ${locationText}.`;
-        try {
-          const jobPage = await page.context().newPage();
-          await jobPage.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-          await sleep(1500);
-          description = await jobPage.$eval(
-            '.description__text, .jobs-description__content',
-            el => el.textContent.trim().substring(0, 2000)
-          ).catch(() => description);
-          await jobPage.close();
-        } catch (_) {}
+        // FIX: Build description from card data — NO separate page load per job
+        const description = `${title} position at ${company} in ${locationText}. Apply on LinkedIn.`;
 
         jobs.push({ title, company, location: locationText, url: jobUrl, description });
         if (jobs.length >= maxJobs) break;
@@ -102,33 +98,39 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Indeed Scraper ──────────────────────────────────────────────────────────
+// ─── Indeed Scraper ───────────────────────────────────────────────────────────
+// FIX: Removed per-job page open for description
 
 async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    const query = encodeURIComponent(role);
-    const loc = encodeURIComponent(location);
-    // Use Indeed India for Indian locations, global for others
-    const isIndia = !['new york','texas','california','washington','usa','remote usa'].some(
-      x => location.toLowerCase().includes(x)
-    );
+    const query   = encodeURIComponent(role);
+    const loc     = encodeURIComponent(location);
+    const isIndia = !['new york','texas','california','washington','usa','remote usa']
+      .some(x => location.toLowerCase().includes(x));
     const baseUrl = isIndia ? 'https://in.indeed.com' : 'https://www.indeed.com';
-    const url = `${baseUrl}/jobs?q=${query}&l=${loc}&fromage=1&sort=date`;
+    const url     = `${baseUrl}/jobs?q=${query}&l=${loc}&fromage=1&sort=date`;
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2000);
+    await sleep(1500);
 
-    // Handle captcha check
-    const title = await page.title();
-    if (title.toLowerCase().includes('captcha') || title.toLowerCase().includes('robot')) {
+    const pageTitle = await page.title();
+    if (
+      pageTitle.toLowerCase().includes('captcha') ||
+      pageTitle.toLowerCase().includes('robot')
+    ) {
       console.warn('Indeed captcha detected, skipping');
       return jobs;
     }
 
-    await page.waitForSelector('[data-testid="job-title"], .jobTitle', { timeout: 15000 });
+    await page.waitForSelector(
+      '[data-testid="job-title"], .jobTitle',
+      { timeout: 15000 }
+    ).catch(() => {});
 
     const cards = await page.$$('[data-testid="slider_item"], .job_seen_beacon, .resultContent');
+    console.log(`Indeed: found ${cards.length} cards for "${role}" in "${location}"`);
+
     for (const card of cards.slice(0, maxJobs)) {
       try {
         const title = await card.$eval(
@@ -156,17 +158,8 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
 
         const jobUrl = relUrl.startsWith('http') ? relUrl : `${baseUrl}${relUrl}`;
 
-        let description = `${role} position at ${company} in ${locationText}.`;
-        try {
-          const jobPage = await page.context().newPage();
-          await jobPage.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-          await sleep(1000);
-          description = await jobPage.$eval(
-            '#jobDescriptionText, .jobsearch-jobDescriptionText',
-            el => el.textContent.trim().substring(0, 2000)
-          ).catch(() => description);
-          await jobPage.close();
-        } catch (_) {}
+        // FIX: No separate page load per job
+        const description = `${title} position at ${company} in ${locationText}. Apply on Indeed.`;
 
         jobs.push({ title, company, location: locationText, url: jobUrl, description });
         if (jobs.length >= maxJobs) break;
@@ -178,37 +171,38 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Google Jobs Scraper ─────────────────────────────────────────────────────
+// ─── Google Jobs Scraper ──────────────────────────────────────────────────────
 
 async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
     const query = encodeURIComponent(`${role} jobs in ${location}`);
-    const url = `https://www.google.com/search?q=${query}&ibp=htl;jobs&htivrt=jobs&htichips=date_posted:today`;
+    const url   = `https://www.google.com/search?q=${query}&ibp=htl;jobs&htivrt=jobs&htichips=date_posted:today`;
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(3000);
+    await sleep(2000);
 
-    // Click into jobs panel
     try {
       await page.click('[data-ved] .gws-plugins-horizon-jobs__tl-lif', { timeout: 5000 });
-      await sleep(1000);
+      await sleep(500);
     } catch (_) {}
 
-    await page.waitForSelector('[jsname="MZArnb"], .PwjeAc', { timeout: 15000 });
+    await page.waitForSelector('[jsname="MZArnb"], .PwjeAc', { timeout: 15000 }).catch(() => {});
 
     const cards = await page.$$('[jsname="MZArnb"], li.iFjolb');
+    console.log(`Google Jobs: found ${cards.length} cards for "${role}" in "${location}"`);
+
     for (const card of cards.slice(0, maxJobs)) {
       try {
         await card.click();
-        await sleep(1500);
+        await sleep(800);
 
         const title = await page.$eval(
           '.KLsYvd, [data-ved] h2.KLsYvd',
           el => el.textContent.trim()
-        ).catch(async () => {
-          return await card.$eval('.BjJfJf, [class*="title"]', el => el.textContent.trim()).catch(() => null);
-        });
+        ).catch(async () =>
+          await card.$eval('.BjJfJf, [class*="title"]', el => el.textContent.trim()).catch(() => null)
+        );
         if (!title) continue;
         if (shouldExclude(title, excludeKeywords)) continue;
 
@@ -230,7 +224,7 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
 
         const description = await page.$eval(
           '.HBvzbc, .NgUYpe',
-          el => el.textContent.trim().substring(0, 2000)
+          el => el.textContent.trim().substring(0, 1000)
         ).catch(() => `${role} position at ${company}.`);
 
         jobs.push({ title, company, location: locationText, url: jobUrl, description });
@@ -243,14 +237,13 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
   return jobs;
 }
 
-// ─── Company Career Pages ────────────────────────────────────────────────────
+// ─── Company Career Pages ─────────────────────────────────────────────────────
+// FIX: Reduced to 3 companies and added 20s timeout per company
 
 const COMPANY_CAREERS = [
-  { name: 'Infosys', url: 'https://career.infosys.com/joblist', titleSel: '.job-title, h3, .position', companySel: null, locationSel: '.location, .job-location', linkSel: 'a' },
-  { name: 'TCS', url: 'https://www.tcs.com/careers/tcs-careers', titleSel: '.job-title, h3', companySel: null, locationSel: '.location', linkSel: 'a' },
-  { name: 'Wipro', url: 'https://careers.wipro.com/careers-home/', titleSel: '.job-title, h3', companySel: null, locationSel: '.location', linkSel: 'a' },
-  { name: 'HCL', url: 'https://www.hcltech.com/careers', titleSel: '.job-title, h3', companySel: null, locationSel: '.location', linkSel: 'a' },
-  { name: 'Cognizant', url: 'https://careers.cognizant.com/global/en', titleSel: '.job-title, h3', companySel: null, locationSel: '.location', linkSel: 'a' },
+  { name: 'Infosys',   url: 'https://career.infosys.com/joblist' },
+  { name: 'Wipro',     url: 'https://careers.wipro.com/careers-home/' },
+  { name: 'Cognizant', url: 'https://careers.cognizant.com/global/en' },
 ];
 
 async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords) {
@@ -258,16 +251,17 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
   for (const company of COMPANY_CAREERS) {
     if (jobs.length >= maxJobs) break;
     try {
-      await page.goto(company.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await sleep(2000);
+      await page.goto(company.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await sleep(1000);
 
-      // Try search if available
       try {
-        const searchBox = await page.$('input[type="search"], input[placeholder*="search"], input[name*="keyword"]');
+        const searchBox = await page.$(
+          'input[type="search"], input[placeholder*="search"], input[name*="keyword"]'
+        );
         if (searchBox) {
           await searchBox.fill(role);
           await page.keyboard.press('Enter');
-          await sleep(2000);
+          await sleep(1500);
         }
       } catch (_) {}
 
@@ -277,9 +271,11 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
           const text = await link.textContent();
           if (!text || text.trim().length < 5) continue;
           const title = text.trim();
-          if (!title.toLowerCase().includes('engineer') &&
-              !title.toLowerCase().includes('developer') &&
-              !title.toLowerCase().includes('software')) continue;
+          if (
+            !title.toLowerCase().includes('engineer') &&
+            !title.toLowerCase().includes('developer') &&
+            !title.toLowerCase().includes('software')
+          ) continue;
           if (shouldExclude(title, excludeKeywords)) continue;
 
           const href = await link.getAttribute('href');
@@ -303,7 +299,7 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
   return jobs;
 }
 
-// ─── Deduplicate ─────────────────────────────────────────────────────────────
+// ─── Deduplicate ──────────────────────────────────────────────────────────────
 
 function deduplicateJobs(jobs) {
   const seen = new Set();
@@ -315,7 +311,7 @@ function deduplicateJobs(jobs) {
   });
 }
 
-// ─── Routes ──────────────────────────────────────────────────────────────────
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -323,11 +319,10 @@ app.get('/health', (req, res) => {
 
 // LinkedIn Jobs
 app.post('/linkedin-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
   const excludeKeywords = filters.excludeKeywords || [];
   let allJobs = [];
   let browser;
-
   try {
     browser = await launchBrowser();
     const context = await browser.newContext({
@@ -341,7 +336,7 @@ app.post('/linkedin-jobs', async (req, res) => {
         console.log(`LinkedIn: scraping "${search.role}" in "${location}"`);
         const jobs = await scrapeLinkedIn(page, search.role, location, maxJobsPerSearch, excludeKeywords);
         allJobs.push(...jobs);
-        await sleep(2000);
+        await sleep(1000);
       }
     }
 
@@ -358,11 +353,10 @@ app.post('/linkedin-jobs', async (req, res) => {
 
 // Indeed Jobs
 app.post('/indeed-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
   const excludeKeywords = filters.excludeKeywords || [];
   let allJobs = [];
   let browser;
-
   try {
     browser = await launchBrowser();
     const context = await browser.newContext({
@@ -375,7 +369,7 @@ app.post('/indeed-jobs', async (req, res) => {
         console.log(`Indeed: scraping "${search.role}" in "${location}"`);
         const jobs = await scrapeIndeed(page, search.role, location, maxJobsPerSearch, excludeKeywords);
         allJobs.push(...jobs);
-        await sleep(3000);
+        await sleep(1500);
       }
     }
 
@@ -392,11 +386,10 @@ app.post('/indeed-jobs', async (req, res) => {
 
 // Google Jobs
 app.post('/google-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
   const excludeKeywords = filters.excludeKeywords || [];
   let allJobs = [];
   let browser;
-
   try {
     browser = await launchBrowser();
     const context = await browser.newContext({
@@ -410,7 +403,7 @@ app.post('/google-jobs', async (req, res) => {
         console.log(`Google Jobs: scraping "${search.role}" in "${location}"`);
         const jobs = await scrapeGoogleJobs(page, search.role, location, maxJobsPerSearch, excludeKeywords);
         allJobs.push(...jobs);
-        await sleep(3000);
+        await sleep(1500);
       }
     }
 
@@ -427,11 +420,10 @@ app.post('/google-jobs', async (req, res) => {
 
 // Company Career Pages
 app.post('/company-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
   const excludeKeywords = filters.excludeKeywords || [];
   let allJobs = [];
   let browser;
-
   try {
     browser = await launchBrowser();
     const context = await browser.newContext({
@@ -444,7 +436,7 @@ app.post('/company-jobs', async (req, res) => {
       console.log(`Company: scraping "${search.role}" in "${location}"`);
       const jobs = await scrapeCompanyJobs(page, search.role, location, maxJobsPerSearch, excludeKeywords);
       allJobs.push(...jobs);
-      await sleep(2000);
+      await sleep(1000);
     }
 
     await browser.close();
@@ -458,7 +450,7 @@ app.post('/company-jobs', async (req, res) => {
   }
 });
 
-// ─── Auto Apply ──────────────────────────────────────────────────────────────
+// ─── Auto Apply ───────────────────────────────────────────────────────────────
 
 app.post('/auto-apply', async (req, res) => {
   const { jobUrl, platform, candidate, jobTitle, company } = req.body;
@@ -509,49 +501,29 @@ app.post('/auto-apply', async (req, res) => {
 async function applyLinkedIn(page, jobUrl, candidate) {
   await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
-
-  // Click Easy Apply button
   const easyApplyBtn = await page.$('button.jobs-apply-button, button[aria-label*="Easy Apply"]');
-  if (!easyApplyBtn) throw new Error('No Easy Apply button found — job may require manual application');
-
+  if (!easyApplyBtn) throw new Error('No Easy Apply button found');
   await easyApplyBtn.click();
   await sleep(2000);
-
-  // Fill contact info
   await fillField(page, 'input[name="phoneNumber"], input[id*="phone"]', candidate.phone || '');
   await fillField(page, 'input[id*="email"]', candidate.email);
-
-  // Multi-step form — click Next/Submit up to 5 times
   for (let i = 0; i < 5; i++) {
     const submitBtn = await page.$('button[aria-label="Submit application"]');
-    if (submitBtn) {
-      await submitBtn.click();
-      await sleep(2000);
-      break;
-    }
+    if (submitBtn) { await submitBtn.click(); await sleep(2000); break; }
     const nextBtn = await page.$('button[aria-label="Continue to next step"], button[aria-label="Review your application"]');
-    if (nextBtn) {
-      await nextBtn.click();
-      await sleep(1500);
-    } else {
-      break;
-    }
+    if (nextBtn) { await nextBtn.click(); await sleep(1500); } else break;
   }
 }
 
 async function applyIndeed(page, jobUrl, candidate) {
   await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
-
   const applyBtn = await page.$('button[id*="apply"], a[id*="apply"], button[class*="apply"]');
   if (!applyBtn) throw new Error('No apply button found on Indeed job page');
-
   await applyBtn.click();
   await sleep(2000);
-
   await fillField(page, 'input[name="email"], input[type="email"]', candidate.email);
   await fillField(page, 'input[name="name"], input[id*="name"]', candidate.fullName || '');
-
   const continueBtn = await page.$('button[type="submit"], button[id*="submit"]');
   if (continueBtn) await continueBtn.click();
 }
@@ -559,20 +531,13 @@ async function applyIndeed(page, jobUrl, candidate) {
 async function applyGeneric(page, jobUrl, candidate) {
   await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
-
-  // Try common apply button patterns
   const applySelectors = [
     'a[href*="apply"]', 'button:has-text("Apply")', 'a:has-text("Apply Now")',
     '[class*="apply"]', '[id*="apply"]'
   ];
   for (const sel of applySelectors) {
-    try {
-      await page.click(sel, { timeout: 3000 });
-      await sleep(2000);
-      break;
-    } catch (_) {}
+    try { await page.click(sel, { timeout: 3000 }); await sleep(2000); break; } catch (_) {}
   }
-
   await fillField(page, 'input[type="email"], input[name="email"]', candidate.email);
   await fillField(page, 'input[name="name"], input[name="fullName"], input[id*="name"]', candidate.fullName || '');
   if (candidate.coverLetter) {
@@ -584,9 +549,7 @@ async function fillField(page, selector, value) {
   if (!value) return;
   try {
     const el = await page.$(selector);
-    if (el) {
-      await el.fill(value);
-    }
+    if (el) await el.fill(value);
   } catch (_) {}
 }
 
@@ -594,11 +557,5 @@ async function fillField(page, selector, value) {
 
 app.listen(PORT, () => {
   console.log(`Job scraper server running on port ${PORT}`);
-  console.log('Endpoints:');
-  console.log('  POST /linkedin-jobs');
-  console.log('  POST /indeed-jobs');
-  console.log('  POST /google-jobs');
-  console.log('  POST /company-jobs');
-  console.log('  POST /auto-apply');
-  console.log('  GET  /health');
+  console.log('Endpoints: POST /linkedin-jobs | POST /indeed-jobs | POST /google-jobs | POST /company-jobs | POST /auto-apply | GET /health');
 });
