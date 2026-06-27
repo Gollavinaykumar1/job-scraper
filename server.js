@@ -43,7 +43,7 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
     const url   = `https://www.linkedin.com/jobs/search/?keywords=${query}&location=${loc}&f_TPR=r86400&f_E=2%2C3&sortBy=DD`;
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2000);
+    await sleep(1500);
 
     try {
       await page.click('button[action-type="ACCEPT"]', { timeout: 3000 });
@@ -94,61 +94,64 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Naukri Scraper (REPLACES Indeed — stable Indian job portal) ──────────────
+// ─── Naukri Scraper (replaces Indeed) ────────────────────────────────────────
 
-async function scrapeNaukri(page, role, location, maxJobs, excludeKeywords) {
+async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    const query = role.toLowerCase().replace(/ /g, '-');
-    const loc   = location.toLowerCase().replace(/ /g, '-');
+    const query = role.toLowerCase().replace(/\s+/g, '-');
+    const loc   = location.toLowerCase().replace(/\s+/g, '-');
     const url   = `https://www.naukri.com/${query}-jobs-in-${loc}?experience=0`;
 
     console.log(`Naukri: loading ${url}`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(3000);
 
-    // Naukri stable selectors
+    // Wait for job cards
     await page.waitForSelector(
-      '.jobTuple, .job-container, article.jobTupleHeader, .srp-jobtuple-wrapper',
+      '.srp-jobtuple-wrapper, .jobTuple, article.jobTuple, .job-tuple, [class*="jobTuple"]',
       { timeout: 15000 }
-    ).catch(() => console.warn('Naukri: waiting for fallback selectors'));
+    ).catch(() => console.warn('Naukri: job cards selector timeout'));
 
     await sleep(1000);
 
     const cards = await page.$$(
-      '.jobTuple, .job-container, article.jobTupleHeader, ' +
-      '.srp-jobtuple-wrapper, [class*="jobTuple"], [class*="job-tuple"]'
+      '.srp-jobtuple-wrapper, .jobTuple, article.jobTuple, [class*="jobTuple"]'
     );
 
     console.log(`Naukri: found ${cards.length} cards for "${role}" in "${location}"`);
 
     for (const card of cards.slice(0, maxJobs)) {
       try {
+        // Title
         const title = await card.$eval(
-          'a.title, .title a, [class*="title"] a, h2 a, .jobTitle a, a[class*="title"]',
+          'a.title, .title a, [class*="title"] a, h2 a, a[class*="jobtitle"]',
           el => el.textContent.trim()
         ).catch(() => null);
         if (!title) continue;
         if (shouldExclude(title, excludeKeywords)) continue;
 
+        // Company
         const company = await card.$eval(
-          'a.subTitle, .subTitle, [class*="company"] a, [class*="companyInfo"] a, .comp-name',
+          'a.comp-name, .comp-name, [class*="companyName"], [class*="comp-name"]',
           el => el.textContent.trim()
         ).catch(() => 'Unknown Company');
 
+        // Location
         const locationText = await card.$eval(
-          '[class*="location"], .loc, .locWdth, span[title*="location"]',
+          '.loc-wrap, [class*="location"], [class*="loc"] span, .locWdth',
           el => el.textContent.trim()
         ).catch(() => location);
 
+        // URL
         const jobUrl = await card.$eval(
-          'a.title, a[class*="title"], h2 a, .jobTitle a',
+          'a.title, .title a, [class*="title"] a, h2 a',
           el => el.href
         ).catch(() => null);
         if (!jobUrl) continue;
 
         const description = `${title} position at ${company} in ${locationText}. Apply on Naukri.`;
-        jobs.push({ title, company, location: locationText, url: jobUrl, description, source: 'Naukri' });
+        jobs.push({ title, company, location: locationText, url: jobUrl, description });
         if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
@@ -158,65 +161,70 @@ async function scrapeNaukri(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Google Jobs Scraper (FIXED — uses text search instead of UI panel) ───────
+// ─── Foundit Scraper (replaces Google Jobs) ───────────────────────────────────
 
 async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    // Use site: search to find jobs on known portals — avoids broken Google Jobs UI
-    const portals = ['linkedin.com/jobs', 'naukri.com', 'indeed.com', 'glassdoor.co.in'];
-    
-    for (const portal of portals) {
-      if (jobs.length >= maxJobs) break;
+    const query = encodeURIComponent(role);
+    const loc   = encodeURIComponent(location);
+    const url   = `https://www.foundit.in/srp/results?query=${query}&location=${loc}&experienceRanges=0~1`;
+
+    console.log(`Foundit: loading ${url}`);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await sleep(3000);
+
+    // Wait for job cards
+    await page.waitForSelector(
+      '.jobContainer, .card-apply-content, [class*="jobContainer"], .srpResultCardContainer, [class*="srpResultCard"]',
+      { timeout: 15000 }
+    ).catch(() => console.warn('Foundit: job cards selector timeout'));
+
+    await sleep(1000);
+
+    const cards = await page.$$(
+      '.jobContainer, .card-apply-content, [class*="jobContainer"], .srpResultCardContainer, [class*="srpResultCard"]'
+    );
+
+    console.log(`Foundit: found ${cards.length} cards for "${role}" in "${location}"`);
+
+    for (const card of cards.slice(0, maxJobs)) {
       try {
-        const query = encodeURIComponent(`site:${portal} "${role}" "${location}" jobs`);
-        const url   = `https://www.google.com/search?q=${query}&num=5`;
+        // Title
+        const title = await card.$eval(
+          '.jobTitle, [class*="jobTitle"], h3 a, h2 a, a[class*="title"]',
+          el => el.textContent.trim()
+        ).catch(() => null);
+        if (!title) continue;
+        if (shouldExclude(title, excludeKeywords)) continue;
 
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await sleep(2000);
+        // Company
+        const company = await card.$eval(
+          '.companyName, [class*="companyName"], [class*="company"] span',
+          el => el.textContent.trim()
+        ).catch(() => 'Unknown Company');
 
-        // Extract search result links
-        const results = await page.$$eval(
-          'a[href*="' + portal.split('/')[0] + '"]',
-          els => els
-            .map(el => ({
-              href: el.href,
-              text: el.textContent.trim()
-            }))
-            .filter(r => r.href && r.text && r.text.length > 10)
-            .slice(0, 3)
-        ).catch(() => []);
+        // Location
+        const locationText = await card.$eval(
+          '.locationText, [class*="location"], [class*="Location"] span',
+          el => el.textContent.trim()
+        ).catch(() => location);
 
-        for (const result of results) {
-          if (jobs.length >= maxJobs) break;
-          if (!result.href || result.href.includes('google.com')) continue;
-          
-          // Extract job title from link text
-          const title = result.text
-            .replace(/\s+/g, ' ')
-            .substring(0, 100)
-            .trim();
-          
-          if (!title) continue;
-          if (shouldExclude(title, excludeKeywords)) continue;
+        // URL
+        const jobUrl = await card.$eval(
+          'a[href*="/job/"], a[href*="/srp/"], h3 a, h2 a, a[class*="title"]',
+          el => el.href
+        ).catch(() => null);
+        if (!jobUrl) continue;
 
-          jobs.push({
-            title: title || `${role} opportunity`,
-            company: portal.split('.')[0].charAt(0).toUpperCase() + portal.split('.')[0].slice(1) + ' Listing',
-            location: location,
-            url: result.href,
-            description: `${role} position found via Google search on ${portal}`,
-            source: 'Google Jobs'
-          });
-        }
-
-        await sleep(1000);
+        const fullUrl = jobUrl.startsWith('http') ? jobUrl : `https://www.foundit.in${jobUrl}`;
+        const description = `${title} position at ${company} in ${locationText}. Apply on Foundit.`;
+        jobs.push({ title, company, location: locationText, url: fullUrl, description });
+        if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
-
-    console.log(`Google Jobs: found ${jobs.length} jobs for "${role}" in "${location}"`);
   } catch (err) {
-    console.error(`Google Jobs scrape error [${role} @ ${location}]:`, err.message);
+    console.error(`Foundit scrape error [${role} @ ${location}]:`, err.message);
   }
   return jobs;
 }
@@ -270,8 +278,7 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
             company: company.name,
             location,
             url: jobUrl,
-            description: `${title} position at ${company.name} in ${location}.`,
-            source: 'Company Career Page'
+            description: `${title} position at ${company.name} in ${location}.`
           });
           if (jobs.length >= maxJobs) break;
         } catch (_) {}
@@ -335,7 +342,7 @@ app.post('/linkedin-jobs', async (req, res) => {
   }
 });
 
-// Indeed Jobs → NOW USES NAUKRI (stable Indian portal)
+// Naukri Jobs (route stays /indeed-jobs so n8n needs no changes)
 app.post('/indeed-jobs', async (req, res) => {
   const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
   const excludeKeywords = filters.excludeKeywords || [];
@@ -350,8 +357,8 @@ app.post('/indeed-jobs', async (req, res) => {
 
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        console.log(`Naukri (via indeed route): scraping "${search.role}" in "${location}"`);
-        const jobs = await scrapeNaukri(page, search.role, location, maxJobsPerSearch, excludeKeywords);
+        console.log(`Naukri: scraping "${search.role}" in "${location}"`);
+        const jobs = await scrapeIndeed(page, search.role, location, maxJobsPerSearch, excludeKeywords);
         allJobs.push(...jobs);
         await sleep(1500);
       }
@@ -368,7 +375,7 @@ app.post('/indeed-jobs', async (req, res) => {
   }
 });
 
-// Google Jobs
+// Foundit Jobs (route stays /google-jobs so n8n needs no changes)
 app.post('/google-jobs', async (req, res) => {
   const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
   const excludeKeywords = filters.excludeKeywords || [];
@@ -384,7 +391,7 @@ app.post('/google-jobs', async (req, res) => {
 
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        console.log(`Google Jobs: scraping "${search.role}" in "${location}"`);
+        console.log(`Foundit: scraping "${search.role}" in "${location}"`);
         const jobs = await scrapeGoogleJobs(page, search.role, location, maxJobsPerSearch, excludeKeywords);
         allJobs.push(...jobs);
         await sleep(1500);
@@ -393,11 +400,11 @@ app.post('/google-jobs', async (req, res) => {
 
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Google Jobs: returning ${allJobs.length} jobs`);
+    console.log(`Foundit: returning ${allJobs.length} jobs`);
     res.json(allJobs);
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
-    console.error('Google Jobs route error:', err);
+    console.error('Foundit route error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -465,7 +472,8 @@ app.post('/auto-apply', async (req, res) => {
     res.json({
       success: true,
       message: `Applied to ${jobTitle} at ${company}`,
-      platform, jobUrl,
+      platform,
+      jobUrl,
       appliedAt: new Date().toISOString()
     });
   } catch (err) {
@@ -474,7 +482,8 @@ app.post('/auto-apply', async (req, res) => {
     res.json({
       success: false,
       message: err.message,
-      platform, jobUrl,
+      platform,
+      jobUrl,
       appliedAt: new Date().toISOString()
     });
   }
@@ -525,7 +534,8 @@ async function applyGeneric(page, jobUrl, candidate) {
   await fillField(page, 'input[type="email"], input[name="email"]', candidate.email);
   await fillField(page, 'input[name="name"], input[name="fullName"], input[id*="name"]', candidate.fullName || '');
   if (candidate.coverLetter) {
-    await fillField(page,
+    await fillField(
+      page,
       'textarea[name*="cover"], textarea[id*="cover"], textarea[placeholder*="cover"]',
       candidate.coverLetter
     );
