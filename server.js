@@ -127,109 +127,100 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Google Jobs ──────────────────────────────────────────────────────────────
-// FIX: found 0 cards — selector [jsname="MZArnb"] no longer exists
-// Solution: use page.evaluate to find job cards by scanning the DOM structure
+// ─── Bing Jobs Scraper (replaces Google Jobs) ────────────────────────────────
+// Google Jobs panel never loads on Railway (headless detection)
+// Bing Jobs works reliably on server IPs — same route /google-jobs, no n8n changes
 
 async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
+    // Bing Jobs has a stable panel that loads on headless browsers
     const query = encodeURIComponent(`${role} jobs in ${location}`);
-    const url = `https://www.google.com/search?q=${query}&ibp=htl;jobs`;
+    const url = `https://www.bing.com/jobs/search?q=${query}&loc=${encodeURIComponent(location)}&age=1`;
 
+    console.log(`Bing Jobs: loading "${role}" in "${location}"`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(3000);
+    await sleep(2000);
 
-    // FIX: Log what job-related elements actually exist on page
-    const foundSelectors = await page.evaluate(() => {
-      const candidates = [
-        '[jsname="MZArnb"]', 'li.iFjolb', '.PwjeAc li', '.gws-plugins-horizon-jobs__tl-lif',
-        '[data-ved] li', '.EimVGf', '.nJXhWc li', '.MQUd2b', 'li[class*="job"]',
-        '[class*="job"] li', '.iFjolb', '.tJ9zfc', 'li.PwjeAc'
+    // Wait for job cards
+    await page.waitForSelector(
+      '.b_algo, .job-result, [class*="jobCard"], [data-jobid], .b_jobs li, .jobRes',
+      { timeout: 15000 }
+    ).catch(() => {});
+
+    // Log what's on the page to fine-tune selectors
+    const found = await page.evaluate(() => {
+      const sels = [
+        '.b_algo', '[data-jobid]', '.job-result', '[class*="jobCard"]',
+        '.b_jobs li', '.jobRes', '.job_item', 'li[class*="job"]',
+        '[class*="JobCard"]', '.b_pag', 'li.b_algo'
       ];
-      const results = {};
-      candidates.forEach(sel => {
-        try { results[sel] = document.querySelectorAll(sel).length; } catch(_) {}
-      });
-      return results;
+      const r = {};
+      sels.forEach(s => { try { r[s] = document.querySelectorAll(s).length; } catch(_){} });
+      return r;
     });
-    console.log('Google Jobs selectors found:', JSON.stringify(foundSelectors));
+    console.log('Bing Jobs page elements:', JSON.stringify(found));
 
-    // FIX: Try clicking the jobs tab if visible
-    try {
-      await page.click('g-scrolling-carousel a:has-text("Jobs"), [data-query*="jobs"] a, .hide-focus-ring[href*="ibp=htl"]', { timeout: 3000 });
-      await sleep(2000);
-    } catch (_) {}
-
-    // FIX: Find the working selector from what's on the page
+    // Try card selectors in order
     let cards = [];
-    const cardSelectors = [
-      '[jsname="MZArnb"]', 'li.iFjolb', '.PwjeAc li',
-      '.gws-plugins-horizon-jobs__tl-lif', '.EimVGf li',
-      'li[class*="iFjolb"]', '[data-ved] .nJXhWc li',
-      '.MQUd2b li', 'li.PwjeAc', '[jscontroller] li[data-ved]'
-    ];
-    for (const sel of cardSelectors) {
+    for (const sel of ['[data-jobid]', '.job-result', '[class*="jobCard"]', '.b_jobs li', '.jobRes', 'li[class*="job"]', '[class*="JobCard"]']) {
       cards = await page.$$(sel);
       if (cards.length > 0) {
-        console.log(`Google Jobs: using selector "${sel}", found ${cards.length} cards for "${role}" in "${location}"`);
+        console.log(`Bing Jobs: using "${sel}", found ${cards.length} cards`);
         break;
       }
     }
 
-    if (cards.length === 0) {
-      // FIX: Last resort — extract job data directly from page text using evaluate
-      console.log('Google Jobs: trying direct DOM extraction');
-      const extracted = await page.evaluate((maxJ) => {
-        const results = [];
-        // Google Jobs panel titles are usually in h2 or specific role elements
-        const titleEls = document.querySelectorAll('.BjJfJf, .tJ9zfc, .rO6jlb, [class*="title"] h2, [class*="KLsYvd"]');
-        titleEls.forEach((el, i) => {
-          if (i >= maxJ) return;
-          const title = el.textContent.trim();
-          if (title.length < 3) return;
-          const card = el.closest('li') || el.closest('[data-ved]') || el.parentElement;
-          const company = card?.querySelector('.nJlQNd, .vNEEBe, [class*="company"]')?.textContent.trim() || 'Unknown';
-          const loc = card?.querySelector('.Qk80Jf, [class*="location"]')?.textContent.trim() || '';
-          const link = card?.querySelector('a')?.href || '';
-          results.push({ title, company, location: loc, url: link });
-        });
-        return results;
-      }, maxJobs);
+    if (cards.length > 0) {
+      for (const card of cards.slice(0, maxJobs)) {
+        try {
+          const title = await card.$eval(
+            'h2, h3, [class*="title"], [class*="Title"], a[href*="job"]',
+            el => el.textContent.trim()
+          ).catch(() => null);
+          if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
 
-      console.log(`Google Jobs: direct extraction found ${extracted.length} jobs`);
-      for (const j of extracted) {
-        if (!j.title || shouldExclude(j.title, excludeKeywords)) continue;
-        jobs.push({ ...j, description: `${j.title} at ${j.company} in ${j.location}.` });
+          const company = await card.$eval(
+            '[class*="company"], [class*="Company"], [class*="employer"]',
+            el => el.textContent.trim()
+          ).catch(() => 'Unknown Company');
+
+          const locationText = await card.$eval(
+            '[class*="location"], [class*="Location"], [class*="city"]',
+            el => el.textContent.trim()
+          ).catch(() => location);
+
+          const jobUrl = await card.$eval('a', el => el.href).catch(() => null);
+          if (!jobUrl) continue;
+
+          jobs.push({ title, company, location: locationText, url: jobUrl, description: `${title} at ${company} in ${locationText}.` });
+          if (jobs.length >= maxJobs) break;
+        } catch (_) {}
       }
-      console.log(`Google Jobs: returning ${jobs.length} jobs`);
-      return jobs;
+    } else {
+      // Fallback: extract from Bing regular search results for jobs
+      console.log('Bing Jobs: falling back to search result snippets');
+      const fallbackUrl = `https://www.bing.com/search?q=${query}+site:linkedin.com+OR+site:indeed.com`;
+      await page.goto(fallbackUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await sleep(1500);
+
+      const results = await page.$$('.b_algo');
+      console.log(`Bing fallback: found ${results.length} results`);
+      for (const result of results.slice(0, maxJobs * 2)) {
+        try {
+          const title = await result.$eval('h2 a', el => el.textContent.trim()).catch(() => null);
+          if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
+          const jobUrl = await result.$eval('h2 a', el => el.href).catch(() => null);
+          if (!jobUrl) continue;
+          const snippet = await result.$eval('.b_caption p, .b_algoSlug', el => el.textContent.trim()).catch(() => '');
+          jobs.push({ title, company: 'See listing', location, url: jobUrl, description: snippet || `${title} - Apply now.` });
+          if (jobs.length >= maxJobs) break;
+        } catch (_) {}
+      }
     }
 
-    for (const card of cards.slice(0, maxJobs)) {
-      try {
-        await card.click();
-        await sleep(1000);
-
-        const title = await page.$eval(
-          '.KLsYvd, .tJ9zfc, .rO6jlb, [role="heading"], .BjJfJf',
-          el => el.textContent.trim()
-        ).catch(async () =>
-          await card.$eval('.BjJfJf, [class*="title"], .I2Cbhb', el => el.textContent.trim()).catch(() => null)
-        );
-        if (!title || shouldExclude(title, excludeKeywords)) continue;
-
-        const company = await page.$eval('.nJlQNd, .vNEEBe, .MoIGvf', el => el.textContent.trim()).catch(() => 'Unknown Company');
-        const locationText = await page.$eval('.Qk80Jf, [class*="location"]', el => el.textContent.trim()).catch(() => location);
-        const jobUrl = await page.$eval('a.pMhGee, a[data-ved][href*="http"], .nJlQNd a', el => el.href).catch(() => null);
-        const description = await page.$eval('.HBvzbc, .NgUYpe, .oNwCmf', el => el.textContent.trim().substring(0, 1000)).catch(() => `${role} at ${company}.`);
-
-        jobs.push({ title, company, location: locationText, url: jobUrl || `https://www.google.com/search?q=${encodeURIComponent(title+' '+company+' jobs')}`, description });
-        if (jobs.length >= maxJobs) break;
-      } catch (_) {}
-    }
-    console.log(`Google Jobs: returning ${jobs.length} jobs`);
-  } catch (err) { console.error(`Google Jobs error [${role}@${location}]:`, err.message); }
+    console.log(`Bing Jobs: returning ${jobs.length} jobs`);
+  } catch (err) { console.error(`Bing Jobs error [${role}@${location}]:`, err.message); }
   return jobs;
 }
 
