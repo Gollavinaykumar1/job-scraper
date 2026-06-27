@@ -363,9 +363,29 @@ app.post('/company-jobs', async (req, res) => {
 });
 
 app.post('/auto-apply', async (req, res) => {
-  const { jobUrl, platform, candidate, jobTitle, company } = req.body;
+  const body = req.body;
+  const jobUrl = body.jobUrl;
+  const platform = body.platform;
+  const jobTitle = body.jobTitle;
+  const company = body.company;
+
+  // Accept BOTH formats:
+  // Format 1 — nested: { candidate: { email, fullName } }
+  // Format 2 — flat from n8n: { candidateEmail, candidateFullName, ... }
+  const candidate = body.candidate || {
+    email: body.candidateEmail || body.email || '',
+    fullName: body.candidateFullName || body.fullName || '',
+    phone: body.candidatePhone || body.phone || '',
+    skills: body.candidateSkills || body.skills || '',
+    resumeText: body.candidateResumeText || body.resumeText || '',
+    coverLetter: body.candidateCoverLetter || body.coverLetter || ''
+  };
+
+  console.log(`Auto Apply: url=${jobUrl}, platform=${platform}, email=${candidate.email}`);
   let browser;
-  if (!jobUrl || !candidate?.email) return res.status(400).json({ error: 'jobUrl and candidate.email required' });
+  if (!jobUrl || !candidate.email) {
+    return res.status(400).json({ error: 'jobUrl and candidate email required', received: { jobUrl, email: candidate.email } });
+  }
   try {
     browser = await launchBrowser();
     const page = await (await browser.newContext({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' })).newPage();
