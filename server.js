@@ -43,7 +43,7 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
     const url   = `https://www.linkedin.com/jobs/search/?keywords=${query}&location=${loc}&f_TPR=r86400&f_E=2%2C3&sortBy=DD`;
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(1500);
+    await sleep(2000);
 
     try {
       await page.click('button[action-type="ACCEPT"]', { timeout: 3000 });
@@ -94,192 +94,127 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Indeed Scraper (FIXED SELECTORS 2024) ───────────────────────────────────
+// ─── Naukri Scraper (REPLACES Indeed — stable Indian job portal) ──────────────
 
-async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
+async function scrapeNaukri(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    const query   = encodeURIComponent(role);
-    const loc     = encodeURIComponent(location);
-    const isIndia = !['new york','texas','california','washington','usa','remote usa']
-      .some(x => location.toLowerCase().includes(x));
-    const baseUrl = isIndia ? 'https://in.indeed.com' : 'https://www.indeed.com';
-    const url     = `${baseUrl}/jobs?q=${query}&l=${loc}&fromage=1&sort=date`;
+    const query = role.toLowerCase().replace(/ /g, '-');
+    const loc   = location.toLowerCase().replace(/ /g, '-');
+    const url   = `https://www.naukri.com/${query}-jobs-in-${loc}?experience=0`;
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2000);
-
-    const pageTitle = await page.title();
-    if (
-      pageTitle.toLowerCase().includes('captcha') ||
-      pageTitle.toLowerCase().includes('robot')
-    ) {
-      console.warn('Indeed captcha detected, skipping');
-      return jobs;
-    }
-
-    // FIXED: broader selector covering new Indeed layout
-    await page.waitForSelector(
-      '[data-testid="job-title"], .jobTitle, .job_seen_beacon, ' +
-      '[class*="job_"], #mosaic-provider-jobcards',
-      { timeout: 15000 }
-    ).catch(() => console.warn('Indeed: job cards selector timeout'));
-
-    await sleep(1000);
-
-    // FIXED: all possible card selectors for current Indeed HTML
-    const cards = await page.$$(
-      '[data-testid="slider_item"], .job_seen_beacon, .resultContent, ' +
-      'li[class*="css-"], div[class*="job_seen"], [data-jk], ' +
-      'li.css-1ac2h1w, div[id^="jobcard"]'
-    );
-
-    console.log(`Indeed: found ${cards.length} cards for "${role}" in "${location}"`);
-
-    for (const card of cards.slice(0, maxJobs)) {
-      try {
-        // FIXED: multiple title selectors
-        const title = await card.$eval(
-          '[data-testid="job-title"] span, .jobTitle span, h2 a span, ' +
-          '[class*="jobTitle"] span, a[id^="job_"] span',
-          el => el.textContent.trim()
-        ).catch(() => null);
-        if (!title) continue;
-        if (shouldExclude(title, excludeKeywords)) continue;
-
-        // FIXED: multiple company selectors
-        const company = await card.$eval(
-          '[data-testid="company-name"], .companyName, ' +
-          '[class*="companyName"], span[class*="company"]',
-          el => el.textContent.trim()
-        ).catch(() => 'Unknown Company');
-
-        // FIXED: multiple location selectors
-        const locationText = await card.$eval(
-          '[data-testid="job-location"], .companyLocation, ' +
-          '[class*="companyLocation"], div[class*="location"]',
-          el => el.textContent.trim()
-        ).catch(() => location);
-
-        // FIXED: multiple URL selectors
-        const relUrl = await card.$eval(
-          '[data-testid="job-title"] a, .jobTitle a, h2 a, ' +
-          'a[id^="job_"], a[data-jk]',
-          el => el.getAttribute('href')
-        ).catch(() => null);
-        if (!relUrl) continue;
-
-        const jobUrl = relUrl.startsWith('http') ? relUrl : `${baseUrl}${relUrl}`;
-        const description = `${title} position at ${company} in ${locationText}. Apply on Indeed.`;
-
-        jobs.push({ title, company, location: locationText, url: jobUrl, description });
-        if (jobs.length >= maxJobs) break;
-      } catch (_) {}
-    }
-  } catch (err) {
-    console.error(`Indeed scrape error [${role} @ ${location}]:`, err.message);
-  }
-  return jobs;
-}
-
-// ─── Google Jobs Scraper (FIXED SELECTORS 2024) ──────────────────────────────
-
-async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
-  const jobs = [];
-  try {
-    // FIXED: updated search URL format
-    const query = encodeURIComponent(`${role} jobs in ${location}`);
-    const url   = `https://www.google.com/search?q=${query}&ibp=htl;jobs`;
-
+    console.log(`Naukri: loading ${url}`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(3000);
 
-    // FIXED: try multiple panel entry selectors
-    const jobPanelSelectors = [
-      '[data-ved] .gws-plugins-horizon-jobs__tl-lif',
-      '.gws-plugins-horizon-jobs__tl-lif',
-      'div[jsname="MZArnb"]',
-      '[class*="jobs"] li',
-      '.job-result-card'
-    ];
-    for (const sel of jobPanelSelectors) {
-      try {
-        await page.click(sel, { timeout: 3000 });
-        await sleep(1000);
-        break;
-      } catch (_) {}
-    }
-
-    // FIXED: broader wait selector
+    // Naukri stable selectors
     await page.waitForSelector(
-      '[jsname="MZArnb"], li.iFjolb, .PwjeAc, ' +
-      '[class*="job-result"], .lm6Kqb, div[data-cid]',
+      '.jobTuple, .job-container, article.jobTupleHeader, .srp-jobtuple-wrapper',
       { timeout: 15000 }
-    ).catch(() => console.warn('Google Jobs: panel selector timeout'));
+    ).catch(() => console.warn('Naukri: waiting for fallback selectors'));
 
-    await sleep(1500);
+    await sleep(1000);
 
-    // FIXED: broader card selectors
     const cards = await page.$$(
-      '[jsname="MZArnb"], li.iFjolb, ' +
-      'li[class*="iFjolb"], div[data-cid], .lm6Kqb'
+      '.jobTuple, .job-container, article.jobTupleHeader, ' +
+      '.srp-jobtuple-wrapper, [class*="jobTuple"], [class*="job-tuple"]'
     );
 
-    console.log(`Google Jobs: found ${cards.length} cards for "${role}" in "${location}"`);
+    console.log(`Naukri: found ${cards.length} cards for "${role}" in "${location}"`);
 
     for (const card of cards.slice(0, maxJobs)) {
       try {
-        await card.click();
-        await sleep(1000);
-
-        // FIXED: multiple title selectors for Google Jobs panel
-        const title = await page.$eval(
-          '.KLsYvd, [data-ved] h2.KLsYvd, .sH3zFd, ' +
-          'h2[class*="title"], .BjJfJf, [class*="job-title"]',
+        const title = await card.$eval(
+          'a.title, .title a, [class*="title"] a, h2 a, .jobTitle a, a[class*="title"]',
           el => el.textContent.trim()
-        ).catch(async () =>
-          await card.$eval(
-            '.BjJfJf, [class*="title"], span[class*="title"]',
-            el => el.textContent.trim()
-          ).catch(() => null)
-        );
+        ).catch(() => null);
         if (!title) continue;
         if (shouldExclude(title, excludeKeywords)) continue;
 
-        // FIXED: multiple company selectors
-        const company = await page.$eval(
-          '.nJlQNd, .vNEEBe, .MZGcob, ' +
-          '[class*="company"], [class*="employer"]',
+        const company = await card.$eval(
+          'a.subTitle, .subTitle, [class*="company"] a, [class*="companyInfo"] a, .comp-name',
           el => el.textContent.trim()
         ).catch(() => 'Unknown Company');
 
-        // FIXED: multiple location selectors
-        const locationText = await page.$eval(
-          '.Qk80Jf, .FqK3wc, .ShLJI, ' +
-          '[class*="location"], [class*="Location"]',
+        const locationText = await card.$eval(
+          '[class*="location"], .loc, .locWdth, span[title*="location"]',
           el => el.textContent.trim()
         ).catch(() => location);
 
-        // FIXED: broader apply link selectors including Indian job portals
-        const jobUrl = await page.$eval(
-          'a[data-url], a.pMhGee, ' +
-          'a[href*="linkedin"], a[href*="indeed"], a[href*="naukri"], ' +
-          'a[href*="glassdoor"], a[href*="shine"], a[href*="monster"], ' +
-          '.apply-button a, a[class*="apply"]',
+        const jobUrl = await card.$eval(
+          'a.title, a[class*="title"], h2 a, .jobTitle a',
           el => el.href
         ).catch(() => null);
         if (!jobUrl) continue;
 
-        // FIXED: description with fallback
-        const description = await page.$eval(
-          '.HBvzbc, .NgUYpe, .WbZuDe, [class*="description"]',
-          el => el.textContent.trim().substring(0, 1000)
-        ).catch(() => `${role} position at ${company} in ${locationText}.`);
-
-        jobs.push({ title, company, location: locationText, url: jobUrl, description });
+        const description = `${title} position at ${company} in ${locationText}. Apply on Naukri.`;
+        jobs.push({ title, company, location: locationText, url: jobUrl, description, source: 'Naukri' });
         if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
+  } catch (err) {
+    console.error(`Naukri scrape error [${role} @ ${location}]:`, err.message);
+  }
+  return jobs;
+}
+
+// ─── Google Jobs Scraper (FIXED — uses text search instead of UI panel) ───────
+
+async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
+  const jobs = [];
+  try {
+    // Use site: search to find jobs on known portals — avoids broken Google Jobs UI
+    const portals = ['linkedin.com/jobs', 'naukri.com', 'indeed.com', 'glassdoor.co.in'];
+    
+    for (const portal of portals) {
+      if (jobs.length >= maxJobs) break;
+      try {
+        const query = encodeURIComponent(`site:${portal} "${role}" "${location}" jobs`);
+        const url   = `https://www.google.com/search?q=${query}&num=5`;
+
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await sleep(2000);
+
+        // Extract search result links
+        const results = await page.$$eval(
+          'a[href*="' + portal.split('/')[0] + '"]',
+          els => els
+            .map(el => ({
+              href: el.href,
+              text: el.textContent.trim()
+            }))
+            .filter(r => r.href && r.text && r.text.length > 10)
+            .slice(0, 3)
+        ).catch(() => []);
+
+        for (const result of results) {
+          if (jobs.length >= maxJobs) break;
+          if (!result.href || result.href.includes('google.com')) continue;
+          
+          // Extract job title from link text
+          const title = result.text
+            .replace(/\s+/g, ' ')
+            .substring(0, 100)
+            .trim();
+          
+          if (!title) continue;
+          if (shouldExclude(title, excludeKeywords)) continue;
+
+          jobs.push({
+            title: title || `${role} opportunity`,
+            company: portal.split('.')[0].charAt(0).toUpperCase() + portal.split('.')[0].slice(1) + ' Listing',
+            location: location,
+            url: result.href,
+            description: `${role} position found via Google search on ${portal}`,
+            source: 'Google Jobs'
+          });
+        }
+
+        await sleep(1000);
+      } catch (_) {}
+    }
+
+    console.log(`Google Jobs: found ${jobs.length} jobs for "${role}" in "${location}"`);
   } catch (err) {
     console.error(`Google Jobs scrape error [${role} @ ${location}]:`, err.message);
   }
@@ -335,7 +270,8 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
             company: company.name,
             location,
             url: jobUrl,
-            description: `${title} position at ${company.name} in ${location}.`
+            description: `${title} position at ${company.name} in ${location}.`,
+            source: 'Company Career Page'
           });
           if (jobs.length >= maxJobs) break;
         } catch (_) {}
@@ -399,7 +335,7 @@ app.post('/linkedin-jobs', async (req, res) => {
   }
 });
 
-// Indeed Jobs
+// Indeed Jobs → NOW USES NAUKRI (stable Indian portal)
 app.post('/indeed-jobs', async (req, res) => {
   const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
   const excludeKeywords = filters.excludeKeywords || [];
@@ -414,8 +350,8 @@ app.post('/indeed-jobs', async (req, res) => {
 
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        console.log(`Indeed: scraping "${search.role}" in "${location}"`);
-        const jobs = await scrapeIndeed(page, search.role, location, maxJobsPerSearch, excludeKeywords);
+        console.log(`Naukri (via indeed route): scraping "${search.role}" in "${location}"`);
+        const jobs = await scrapeNaukri(page, search.role, location, maxJobsPerSearch, excludeKeywords);
         allJobs.push(...jobs);
         await sleep(1500);
       }
@@ -423,11 +359,11 @@ app.post('/indeed-jobs', async (req, res) => {
 
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Indeed: returning ${allJobs.length} jobs`);
+    console.log(`Naukri: returning ${allJobs.length} jobs`);
     res.json(allJobs);
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
-    console.error('Indeed route error:', err);
+    console.error('Naukri route error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -529,8 +465,7 @@ app.post('/auto-apply', async (req, res) => {
     res.json({
       success: true,
       message: `Applied to ${jobTitle} at ${company}`,
-      platform,
-      jobUrl,
+      platform, jobUrl,
       appliedAt: new Date().toISOString()
     });
   } catch (err) {
@@ -539,8 +474,7 @@ app.post('/auto-apply', async (req, res) => {
     res.json({
       success: false,
       message: err.message,
-      platform,
-      jobUrl,
+      platform, jobUrl,
       appliedAt: new Date().toISOString()
     });
   }
@@ -591,8 +525,7 @@ async function applyGeneric(page, jobUrl, candidate) {
   await fillField(page, 'input[type="email"], input[name="email"]', candidate.email);
   await fillField(page, 'input[name="name"], input[name="fullName"], input[id*="name"]', candidate.fullName || '');
   if (candidate.coverLetter) {
-    await fillField(
-      page,
+    await fillField(page,
       'textarea[name*="cover"], textarea[id*="cover"], textarea[placeholder*="cover"]',
       candidate.coverLetter
     );
