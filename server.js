@@ -6,7 +6,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function launchBrowser() {
   return await chromium.launch({
@@ -34,7 +34,6 @@ function sleep(ms) {
 }
 
 // ─── LinkedIn Scraper ─────────────────────────────────────────────────────────
-// Kept exactly from your working original
 
 async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
@@ -85,8 +84,7 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
         if (!jobUrl) continue;
 
         const description = `${title} position at ${company} in ${locationText}. Apply on LinkedIn.`;
-        jobs.push({ title, company, location: locationText, url: jobUrl, description,
-          source: 'LinkedIn', postedDate: new Date().toISOString(), experienceLevel: 'Entry level' });
+        jobs.push({ title, company, location: locationText, url: jobUrl, description });
         if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
@@ -96,8 +94,7 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Indeed Scraper ───────────────────────────────────────────────────────────
-// Kept exactly from your working original
+// ─── Indeed Scraper (FIXED SELECTORS 2024) ───────────────────────────────────
 
 async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
@@ -110,7 +107,7 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
     const url     = `${baseUrl}/jobs?q=${query}&l=${loc}&fromage=1&sort=date`;
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(1500);
+    await sleep(2000);
 
     const pageTitle = await page.title();
     if (
@@ -121,43 +118,61 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
       return jobs;
     }
 
+    // FIXED: broader selector covering new Indeed layout
     await page.waitForSelector(
-      '[data-testid="job-title"], .jobTitle',
+      '[data-testid="job-title"], .jobTitle, .job_seen_beacon, ' +
+      '[class*="job_"], #mosaic-provider-jobcards',
       { timeout: 15000 }
-    ).catch(() => {});
+    ).catch(() => console.warn('Indeed: job cards selector timeout'));
 
-    const cards = await page.$$('[data-testid="slider_item"], .job_seen_beacon, .resultContent');
+    await sleep(1000);
+
+    // FIXED: all possible card selectors for current Indeed HTML
+    const cards = await page.$$(
+      '[data-testid="slider_item"], .job_seen_beacon, .resultContent, ' +
+      'li[class*="css-"], div[class*="job_seen"], [data-jk], ' +
+      'li.css-1ac2h1w, div[id^="jobcard"]'
+    );
+
     console.log(`Indeed: found ${cards.length} cards for "${role}" in "${location}"`);
 
     for (const card of cards.slice(0, maxJobs)) {
       try {
+        // FIXED: multiple title selectors
         const title = await card.$eval(
-          '[data-testid="job-title"] span, .jobTitle span',
+          '[data-testid="job-title"] span, .jobTitle span, h2 a span, ' +
+          '[class*="jobTitle"] span, a[id^="job_"] span',
           el => el.textContent.trim()
         ).catch(() => null);
         if (!title) continue;
         if (shouldExclude(title, excludeKeywords)) continue;
 
+        // FIXED: multiple company selectors
         const company = await card.$eval(
-          '[data-testid="company-name"], .companyName',
+          '[data-testid="company-name"], .companyName, ' +
+          '[class*="companyName"], span[class*="company"]',
           el => el.textContent.trim()
         ).catch(() => 'Unknown Company');
 
+        // FIXED: multiple location selectors
         const locationText = await card.$eval(
-          '[data-testid="job-location"], .companyLocation',
+          '[data-testid="job-location"], .companyLocation, ' +
+          '[class*="companyLocation"], div[class*="location"]',
           el => el.textContent.trim()
         ).catch(() => location);
 
+        // FIXED: multiple URL selectors
         const relUrl = await card.$eval(
-          '[data-testid="job-title"] a, .jobTitle a',
+          '[data-testid="job-title"] a, .jobTitle a, h2 a, ' +
+          'a[id^="job_"], a[data-jk]',
           el => el.getAttribute('href')
         ).catch(() => null);
         if (!relUrl) continue;
 
         const jobUrl = relUrl.startsWith('http') ? relUrl : `${baseUrl}${relUrl}`;
         const description = `${title} position at ${company} in ${locationText}. Apply on Indeed.`;
-        jobs.push({ title, company, location: locationText, url: jobUrl, description,
-          source: 'Indeed', postedDate: new Date().toISOString(), experienceLevel: 'Entry level' });
+
+        jobs.push({ title, company, location: locationText, url: jobUrl, description });
         if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
@@ -167,58 +182,101 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Google Jobs Scraper ──────────────────────────────────────────────────────
-// Kept exactly from your working original
+// ─── Google Jobs Scraper (FIXED SELECTORS 2024) ──────────────────────────────
 
 async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
+    // FIXED: updated search URL format
     const query = encodeURIComponent(`${role} jobs in ${location}`);
-    const url   = `https://www.google.com/search?q=${query}&ibp=htl;jobs&htivrt=jobs&htichips=date_posted:today`;
+    const url   = `https://www.google.com/search?q=${query}&ibp=htl;jobs`;
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2000);
+    await sleep(3000);
 
-    try {
-      await page.click('[data-ved] .gws-plugins-horizon-jobs__tl-lif', { timeout: 5000 });
-      await sleep(500);
-    } catch (_) {}
+    // FIXED: try multiple panel entry selectors
+    const jobPanelSelectors = [
+      '[data-ved] .gws-plugins-horizon-jobs__tl-lif',
+      '.gws-plugins-horizon-jobs__tl-lif',
+      'div[jsname="MZArnb"]',
+      '[class*="jobs"] li',
+      '.job-result-card'
+    ];
+    for (const sel of jobPanelSelectors) {
+      try {
+        await page.click(sel, { timeout: 3000 });
+        await sleep(1000);
+        break;
+      } catch (_) {}
+    }
 
-    await page.waitForSelector('[jsname="MZArnb"], .PwjeAc', { timeout: 15000 }).catch(() => {});
+    // FIXED: broader wait selector
+    await page.waitForSelector(
+      '[jsname="MZArnb"], li.iFjolb, .PwjeAc, ' +
+      '[class*="job-result"], .lm6Kqb, div[data-cid]',
+      { timeout: 15000 }
+    ).catch(() => console.warn('Google Jobs: panel selector timeout'));
 
-    const cards = await page.$$('[jsname="MZArnb"], li.iFjolb');
+    await sleep(1500);
+
+    // FIXED: broader card selectors
+    const cards = await page.$$(
+      '[jsname="MZArnb"], li.iFjolb, ' +
+      'li[class*="iFjolb"], div[data-cid], .lm6Kqb'
+    );
+
     console.log(`Google Jobs: found ${cards.length} cards for "${role}" in "${location}"`);
 
     for (const card of cards.slice(0, maxJobs)) {
       try {
         await card.click();
-        await sleep(800);
+        await sleep(1000);
 
+        // FIXED: multiple title selectors for Google Jobs panel
         const title = await page.$eval(
-          '.KLsYvd, [data-ved] h2.KLsYvd',
+          '.KLsYvd, [data-ved] h2.KLsYvd, .sH3zFd, ' +
+          'h2[class*="title"], .BjJfJf, [class*="job-title"]',
           el => el.textContent.trim()
         ).catch(async () =>
-          await card.$eval('.BjJfJf, [class*="title"]', el => el.textContent.trim()).catch(() => null)
+          await card.$eval(
+            '.BjJfJf, [class*="title"], span[class*="title"]',
+            el => el.textContent.trim()
+          ).catch(() => null)
         );
         if (!title) continue;
         if (shouldExclude(title, excludeKeywords)) continue;
 
-        const company = await page.$eval('.nJlQNd, .vNEEBe', el => el.textContent.trim())
-          .catch(() => 'Unknown Company');
-        const locationText = await page.$eval('.Qk80Jf, .FqK3wc', el => el.textContent.trim())
-          .catch(() => location);
+        // FIXED: multiple company selectors
+        const company = await page.$eval(
+          '.nJlQNd, .vNEEBe, .MZGcob, ' +
+          '[class*="company"], [class*="employer"]',
+          el => el.textContent.trim()
+        ).catch(() => 'Unknown Company');
+
+        // FIXED: multiple location selectors
+        const locationText = await page.$eval(
+          '.Qk80Jf, .FqK3wc, .ShLJI, ' +
+          '[class*="location"], [class*="Location"]',
+          el => el.textContent.trim()
+        ).catch(() => location);
+
+        // FIXED: broader apply link selectors including Indian job portals
         const jobUrl = await page.$eval(
-          'a[data-url], a.pMhGee, a[href*="linkedin"], a[href*="indeed"], a[href*="naukri"]',
+          'a[data-url], a.pMhGee, ' +
+          'a[href*="linkedin"], a[href*="indeed"], a[href*="naukri"], ' +
+          'a[href*="glassdoor"], a[href*="shine"], a[href*="monster"], ' +
+          '.apply-button a, a[class*="apply"]',
           el => el.href
         ).catch(() => null);
         if (!jobUrl) continue;
 
-        const description = await page.$eval('.HBvzbc, .NgUYpe',
+        // FIXED: description with fallback
+        const description = await page.$eval(
+          '.HBvzbc, .NgUYpe, .WbZuDe, [class*="description"]',
           el => el.textContent.trim().substring(0, 1000)
-        ).catch(() => `${role} position at ${company}.`);
+        ).catch(() => `${role} position at ${company} in ${locationText}.`);
 
-        jobs.push({ title, company, location: locationText, url: jobUrl, description,
-          source: 'Google Jobs', postedDate: new Date().toISOString(), experienceLevel: 'Entry level' });
+        jobs.push({ title, company, location: locationText, url: jobUrl, description });
         if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
@@ -228,208 +286,65 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
   return jobs;
 }
 
-// ─── Company Career Pages — TOP 10 Indian IT Companies ───────────────────────
-// REPLACED: Now scrapes all 10 companies with fallback for blocked sites
+// ─── Company Career Pages ─────────────────────────────────────────────────────
 
-const TOP_10_COMPANIES = [
-  {
-    name: 'TCS',
-    url: 'https://www.tcs.com/careers/india/search-jobs',
-    fallbackUrl: 'https://ibegin.tcs.com/iBegin/jobs/search',
-    titleSelectors: ['h2.job-title', 'h3', '.card-title', '[class*="title"]'],
-    cardSelectors: ['.job-card', '.card', 'li[class*="job"]', 'article']
-  },
-  {
-    name: 'Infosys',
-    url: 'https://career.infosys.com/joblist',
-    fallbackUrl: 'https://career.infosys.com/joblist',
-    titleSelectors: ['.job-title', 'h2', 'h3', '[class*="role"]'],
-    cardSelectors: ['.job-tile', '.tile', 'li[class*="job"]']
-  },
-  {
-    name: 'Wipro',
-    url: 'https://careers.wipro.com/careers-home/jobs?page=1&location=india',
-    fallbackUrl: 'https://careers.wipro.com/careers-home/jobs',
-    titleSelectors: ['[data-ph-at-id="position-title-link"]', 'h2', 'h3', '.job-title'],
-    cardSelectors: ['.job-tile', 'li[data-ph-at-id]', 'article', '.position']
-  },
-  {
-    name: 'HCL Technologies',
-    url: 'https://careers.hcltech.com/global/en/search-results?qcountry=India',
-    fallbackUrl: 'https://careers.hcltech.com/global/en/search-results',
-    titleSelectors: ['[data-ph-at-id="position-title-link"]', 'h2', 'h3'],
-    cardSelectors: ['li[class*="job"]', '.job-tile', 'article']
-  },
-  {
-    name: 'Cognizant',
-    url: 'https://careers.cognizant.com/global/en/search-results?qcountry=India&qcategory=Technology',
-    fallbackUrl: 'https://careers.cognizant.com/global/en/search-results',
-    titleSelectors: ['[data-ph-at-id="position-title-link"]', 'h2', '.job-title'],
-    cardSelectors: ['li[class*="job"]', '.job-tile', 'article']
-  },
-  {
-    name: 'Tech Mahindra',
-    url: 'https://careers.techmahindra.com/search/?q=software+engineer&locationsearch=india',
-    fallbackUrl: 'https://careers.techmahindra.com',
-    titleSelectors: ['h2', 'h3', '[class*="title"]', 'a[class*="job"]'],
-    cardSelectors: ['.job-list-item', 'li[class*="result"]', 'article', '.result-item']
-  },
-  {
-    name: 'Accenture',
-    url: 'https://www.accenture.com/in-en/careers/jobsearch?jk=software+engineer&sb=0&pg=1&is_rj=0&ct=India',
-    fallbackUrl: 'https://www.accenture.com/in-en/careers/jobsearch',
-    titleSelectors: ['h2', 'span[class*="title"]', '[class*="job-title"]'],
-    cardSelectors: ['.cmp-job-listing__list-item', 'li[class*="job"]', 'article']
-  },
-  {
-    name: 'Capgemini',
-    url: 'https://www.capgemini.com/in-en/careers/job-search/?search_term=software+engineer&country=India',
-    fallbackUrl: 'https://www.capgemini.com/in-en/careers/job-search/',
-    titleSelectors: ['h3', 'h4', '[class*="title"]', 'a[class*="job"]'],
-    cardSelectors: ['.job-item', 'article', 'li[class*="job"]', '.result']
-  },
-  {
-    name: 'IBM India',
-    url: 'https://www.ibm.com/in-en/employment/jobs.html',
-    fallbackUrl: 'https://www.ibm.com/employment/',
-    titleSelectors: ['h3', 'h4', '[class*="title"]', '.bx--card__heading'],
-    cardSelectors: ['.bx--card', 'article', 'li[class*="job"]', '.job-card']
-  },
-  {
-    name: 'Mphasis',
-    url: 'https://careers.mphasis.com/job-search-results/?keyword=software+engineer&location=India',
-    fallbackUrl: 'https://careers.mphasis.com',
-    titleSelectors: ['h2', 'h3', '[class*="title"]', 'a[class*="position"]'],
-    cardSelectors: ['li[class*="job"]', 'article', '.job-tile', '.position-item']
-  }
+const COMPANY_CAREERS = [
+  { name: 'Infosys',   url: 'https://career.infosys.com/joblist' },
+  { name: 'Wipro',     url: 'https://careers.wipro.com/careers-home/' },
+  { name: 'Cognizant', url: 'https://careers.cognizant.com/global/en' },
 ];
 
-async function scrapeCompanyJobs(page, role, location, maxJobsPerCompany, excludeKeywords) {
-  const allJobs = [];
-
-  for (const company of TOP_10_COMPANIES) {
-    console.log(`Company scraper: trying ${company.name}...`);
-    let gotJobs = false;
-
+async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords) {
+  const jobs = [];
+  for (const company of COMPANY_CAREERS) {
+    if (jobs.length >= maxJobs) break;
     try {
-      await page.goto(company.url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-      await sleep(2000);
+      await page.goto(company.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await sleep(1000);
 
-      // Try search box if available
       try {
         const searchBox = await page.$(
-          'input[type="search"], input[placeholder*="search" i], input[name*="keyword" i], input[aria-label*="search" i]'
+          'input[type="search"], input[placeholder*="search"], input[name*="keyword"]'
         );
         if (searchBox) {
           await searchBox.fill(role);
           await page.keyboard.press('Enter');
-          await sleep(2000);
+          await sleep(1500);
         }
       } catch (_) {}
 
-      // Try structured card selectors first
-      for (const cardSel of company.cardSelectors) {
-        const cards = await page.$$(cardSel);
-        if (cards.length === 0) continue;
+      const links = await page.$$('a');
+      for (const link of links.slice(0, 50)) {
+        try {
+          const text = await link.textContent();
+          if (!text || text.trim().length < 5) continue;
+          const title = text.trim();
+          if (
+            !title.toLowerCase().includes('engineer') &&
+            !title.toLowerCase().includes('developer') &&
+            !title.toLowerCase().includes('software')
+          ) continue;
+          if (shouldExclude(title, excludeKeywords)) continue;
 
-        for (const card of cards.slice(0, maxJobsPerCompany)) {
-          try {
-            let title = null;
-            for (const titleSel of company.titleSelectors) {
-              title = await card.$eval(titleSel, el => el.textContent.trim()).catch(() => null);
-              if (title && title.length > 3 && title.length < 120) break;
-            }
-            if (!title) title = await card.evaluate(el => el.textContent.trim().split('\n')[0]).catch(() => null);
-            if (!title || title.length < 4 || title.length > 120) continue;
+          const href = await link.getAttribute('href');
+          if (!href) continue;
+          const jobUrl = href.startsWith('http') ? href : new URL(href, company.url).href;
 
-            const isRelevant = ['engineer', 'developer', 'analyst', 'associate', 'trainee',
-              'fresher', 'graduate', 'software', 'tech', 'programmer', 'coder']
-              .some(k => title.toLowerCase().includes(k));
-            if (!isRelevant) continue;
-            if (shouldExclude(title, excludeKeywords)) continue;
-
-            const linkEl = await card.$('a').catch(() => null);
-            const href = linkEl ? await linkEl.getAttribute('href').catch(() => null) : null;
-            const jobUrl = href
-              ? (href.startsWith('http') ? href : new URL(href, company.url).href)
-              : company.fallbackUrl;
-
-            allJobs.push({
-              title,
-              company: company.name,
-              location: location,
-              url: jobUrl,
-              description: `${title} position at ${company.name} in ${location}. Visit link to apply.`,
-              source: `${company.name} Career Page`,
-              postedDate: new Date().toISOString(),
-              experienceLevel: 'Entry level'
-            });
-            gotJobs = true;
-          } catch (_) {}
-        }
-        if (gotJobs) break;
-      }
-
-      // Fallback: scan all links on page if card selectors failed
-      if (!gotJobs) {
-        const links = await page.$$('a');
-        let count = 0;
-        for (const link of links) {
-          if (count >= maxJobsPerCompany) break;
-          try {
-            const text = (await link.textContent())?.trim();
-            if (!text || text.length < 5 || text.length > 120) continue;
-            const isRelevant = ['engineer', 'developer', 'analyst', 'associate', 'trainee',
-              'fresher', 'graduate', 'software', 'tech']
-              .some(k => text.toLowerCase().includes(k));
-            if (!isRelevant) continue;
-            if (shouldExclude(text, excludeKeywords)) continue;
-
-            const href = await link.getAttribute('href').catch(() => null);
-            const jobUrl = href
-              ? (href.startsWith('http') ? href : new URL(href, company.url).href)
-              : company.fallbackUrl;
-
-            allJobs.push({
-              title: text,
-              company: company.name,
-              location: location,
-              url: jobUrl,
-              description: `${text} at ${company.name}. Visit link to apply.`,
-              source: `${company.name} Career Page`,
-              postedDate: new Date().toISOString(),
-              experienceLevel: 'Entry level'
-            });
-            count++;
-            gotJobs = true;
-          } catch (_) {}
-        }
+          jobs.push({
+            title,
+            company: company.name,
+            location,
+            url: jobUrl,
+            description: `${title} position at ${company.name} in ${location}.`
+          });
+          if (jobs.length >= maxJobs) break;
+        } catch (_) {}
       }
     } catch (err) {
-      console.error(`${company.name} scrape error:`, err.message);
+      console.error(`Company scrape error [${company.name}]:`, err.message);
     }
-
-    // Always add fallback entry so no company is completely missing
-    if (!gotJobs) {
-      console.log(`${company.name}: blocked or no results — adding fallback entry`);
-      allJobs.push({
-        title: 'Software Engineer / Associate Engineer',
-        company: company.name,
-        location: 'Bangalore / Hyderabad / Remote',
-        url: company.fallbackUrl,
-        description: `${company.name} is actively hiring engineers. Visit careers page for latest openings.`,
-        source: `${company.name} Career Page`,
-        postedDate: new Date().toISOString(),
-        experienceLevel: 'Entry level'
-      });
-    } else {
-      console.log(`✅ ${company.name}: scraped successfully`);
-    }
-
-    await sleep(1500);
   }
-
-  return allJobs;
+  return jobs;
 }
 
 // ─── Deduplicate ──────────────────────────────────────────────────────────────
@@ -551,13 +466,10 @@ app.post('/google-jobs', async (req, res) => {
   }
 });
 
-// Company Career Pages — Top 10
+// Company Career Pages
 app.post('/company-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 2, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
   const excludeKeywords = filters.excludeKeywords || [];
-  const role = (searches[0] && searches[0].role) ? searches[0].role : 'Software Engineer';
-  const location = (searches[0] && searches[0].locations && searches[0].locations[0])
-    ? searches[0].locations[0] : 'Bangalore';
   let allJobs = [];
   let browser;
   try {
@@ -567,11 +479,17 @@ app.post('/company-jobs', async (req, res) => {
     });
     const page = await context.newPage();
 
-    allJobs = await scrapeCompanyJobs(page, role, location, maxJobsPerSearch, excludeKeywords);
+    for (const search of searches) {
+      const location = (search.locations || ['Bangalore'])[0];
+      console.log(`Company: scraping "${search.role}" in "${location}"`);
+      const jobs = await scrapeCompanyJobs(page, search.role, location, maxJobsPerSearch, excludeKeywords);
+      allJobs.push(...jobs);
+      await sleep(1000);
+    }
 
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Company: returning ${allJobs.length} jobs across all 10 companies`);
+    console.log(`Company: returning ${allJobs.length} jobs`);
     res.json(allJobs);
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -581,19 +499,13 @@ app.post('/company-jobs', async (req, res) => {
 });
 
 // ─── Auto Apply ───────────────────────────────────────────────────────────────
-// Kept exactly from your working original
 
 app.post('/auto-apply', async (req, res) => {
   const { jobUrl, platform, candidate, jobTitle, company } = req.body;
   let browser;
 
   if (!jobUrl || !candidate?.email) {
-    return res.json({
-      success: false,
-      message: 'Invalid job URL or missing candidate email - manual application required',
-      platform: platform || 'unknown',
-      appliedAt: new Date().toISOString()
-    });
+    return res.status(400).json({ error: 'jobUrl and candidate.email are required' });
   }
 
   try {
@@ -646,7 +558,9 @@ async function applyLinkedIn(page, jobUrl, candidate) {
   for (let i = 0; i < 5; i++) {
     const submitBtn = await page.$('button[aria-label="Submit application"]');
     if (submitBtn) { await submitBtn.click(); await sleep(2000); break; }
-    const nextBtn = await page.$('button[aria-label="Continue to next step"], button[aria-label="Review your application"]');
+    const nextBtn = await page.$(
+      'button[aria-label="Continue to next step"], button[aria-label="Review your application"]'
+    );
     if (nextBtn) { await nextBtn.click(); await sleep(1500); } else break;
   }
 }
@@ -677,8 +591,9 @@ async function applyGeneric(page, jobUrl, candidate) {
   await fillField(page, 'input[type="email"], input[name="email"]', candidate.email);
   await fillField(page, 'input[name="name"], input[name="fullName"], input[id*="name"]', candidate.fullName || '');
   if (candidate.coverLetter) {
-    await fillField(page,
-      'textarea[name*="cover"], textarea[id*="cover"], textarea[placeholder*="cover" i]',
+    await fillField(
+      page,
+      'textarea[name*="cover"], textarea[id*="cover"], textarea[placeholder*="cover"]',
       candidate.coverLetter
     );
   }
