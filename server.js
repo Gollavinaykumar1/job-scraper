@@ -49,83 +49,81 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Indeed ───────────────────────────────────────────────────────────────────
-// Using the EXACT approach that returned 16 links and 2 jobs in previous working deploy
+// ─── Fresherworld Scraper (replaces Indeed) ───────────────────────────────────
+// Fresherworld.com — Indian fresher jobs portal, no Cloudflare, stable HTML
 
 async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    const isIndia = !['new york','texas','california','washington','usa','remote usa'].some(x => location.toLowerCase().includes(x));
-    const baseUrl = isIndia ? 'https://in.indeed.com' : 'https://www.indeed.com';
-    const url = `${baseUrl}/jobs?q=${encodeURIComponent(role)}&l=${encodeURIComponent(location)}&fromage=1&sort=date`;
+    const query = role.toLowerCase().replace(/\s+/g, '-');
+    const loc = location.toLowerCase().replace(/\s+/g, '-');
+    const url = `https://www.fresherworld.com/jobs/${query}-jobs-in-${loc}`;
 
+    console.log(`Fresherworld: loading "${role}" in "${location}"`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2500);
+    await sleep(2000);
 
     const pageTitle = await page.title();
-    console.log(`Indeed: page title = "${pageTitle}"`);
-    if (pageTitle.toLowerCase().includes('captcha') || pageTitle.toLowerCase().includes('robot')) {
-      console.warn('Indeed: captcha detected');
-      return jobs;
+    console.log(`Fresherworld: page title = "${pageTitle}"`);
+
+    await page.waitForSelector('.job-container, .job_list, .joblist, article.job, .job-card, [class*="job"]', { timeout: 15000 }).catch(() => {});
+
+    // Log actual classes on page to find correct selector
+    const classes = await page.evaluate(() => {
+      const els = document.querySelectorAll('[class]');
+      const found = new Set();
+      els.forEach(el => {
+        el.className.toString().split(' ').forEach(c => {
+          if (c && (c.toLowerCase().includes('job') || c.toLowerCase().includes('list') || c.toLowerCase().includes('card'))) found.add(c);
+        });
+      });
+      return [...found].slice(0, 20).join(', ');
+    });
+    console.log(`Fresherworld: classes found = ${classes}`);
+
+    let cards = [];
+    for (const sel of ['.job-container', '.job_list li', '.joblist li', 'article.job', '.job-card', '[class*="joblist"]', '[class*="job-list"]', '.jobs li', 'ul.jobs > li', '.listing']) {
+      cards = await page.$$(sel);
+      if (cards.length > 0) { console.log(`Fresherworld: using "${sel}", found ${cards.length} cards`); break; }
     }
 
-    // Wait for job links with data-jk
-    await page.waitForSelector('a[data-jk]', { timeout: 15000 }).catch(() => {});
-
-    const jobLinks = await page.$$('a[data-jk]');
-    console.log(`Indeed: found ${jobLinks.length} job links for "${role}" in "${location}"`);
-
-    const seen = new Set();
-    for (const link of jobLinks) {
+    for (const card of cards.slice(0, maxJobs)) {
       try {
-        const jk = await link.getAttribute('data-jk');
-        if (!jk || seen.has(jk)) continue;
-        seen.add(jk);
-
-        // Get title from span inside the anchor
-        const title = await link.evaluate(el => {
-          const span = el.querySelector('span[id], span[title], span') || el;
-          return (span.textContent || '').trim();
-        }).catch(() => null);
-
+        const title = await card.$eval('h2, h3, a[href*="job"], .title, [class*="title"]', el => el.textContent.trim()).catch(() => null);
         if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
-
-        const jobUrl = `${baseUrl}/viewjob?jk=${jk}`;
-
-        // Walk up DOM to find card container for company/location
-        const company = await link.evaluate(el => {
-          let node = el.parentElement;
-          for (let i = 0; i < 8; i++) {
-            if (!node) break;
-            const c = node.querySelector('[data-testid="company-name"], .companyName, [class*="companyName"]');
-            if (c) return c.textContent.trim();
-            node = node.parentElement;
-          }
-          return 'Unknown Company';
-        }).catch(() => 'Unknown Company');
-
-        const locationText = await link.evaluate(el => {
-          let node = el.parentElement;
-          for (let i = 0; i < 8; i++) {
-            if (!node) break;
-            const l = node.querySelector('[data-testid="text-location"], .companyLocation, [class*="companyLocation"]');
-            if (l) return l.textContent.trim();
-            node = node.parentElement;
-          }
-          return '';
-        }).catch(() => location);
-
-        jobs.push({ title, company, location: locationText || location, url: jobUrl, description: `${title} at ${company} in ${locationText || location}. Apply on Indeed.` });
+        const company = await card.$eval('[class*="company"], [class*="employer"], span', el => el.textContent.trim()).catch(() => 'Unknown');
+        const jobUrl = await card.$eval('a', el => el.href).catch(() => null);
+        if (!jobUrl) continue;
+        jobs.push({ title, company, location, url: jobUrl, description: `${title} at ${company} in ${location}. Apply on Fresherworld.` });
         if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
-    console.log(`Indeed: returning ${jobs.length} jobs`);
-  } catch (err) { console.error(`Indeed error:`, err.message); }
+
+    // Fallback: grab all job links directly
+    if (jobs.length === 0) {
+      console.log('Fresherworld: trying link fallback');
+      const links = await page.$$('a[href*="job"], a[href*="fresherworld"]');
+      console.log(`Fresherworld: found ${links.length} job links`);
+      for (const link of links.slice(0, maxJobs * 3)) {
+        try {
+          const text = (await link.textContent() || '').trim();
+          if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
+          const href = await link.getAttribute('href');
+          if (!href || href === '#') continue;
+          const jobUrl = href.startsWith('http') ? href : `https://www.fresherworld.com${href}`;
+          jobs.push({ title: text, company: 'See listing', location, url: jobUrl, description: `${text} - Apply on Fresherworld.` });
+          if (jobs.length >= maxJobs) break;
+        } catch (_) {}
+      }
+    }
+
+    console.log(`Fresherworld: returning ${jobs.length} jobs`);
+  } catch (err) { console.error(`Fresherworld error:`, err.message); }
   return jobs;
 }
 
-// ─── TimesJobs Scraper (replaces Google Jobs) ─────────────────────────────────
-// TimesJobs is an Indian job portal with stable HTML, no bot blocking on Railway
+// ─── TimesJobs Scraper (replaces Google Jobs) ────────────────────────────────
+// TimesJobs — networkidle wait needed since cards load via JS
 
 async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
@@ -135,33 +133,68 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
     const url = `https://www.timesjobs.com/candidate/job-search.html?searchType=personalizedSearch&from=submit&txtKeywords=${query}&txtLocation=${loc}`;
 
     console.log(`TimesJobs: loading "${role}" in "${location}"`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // FIX: use networkidle instead of domcontentloaded — cards load via JS
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
     await sleep(2000);
 
-    // Log page title to confirm it loaded
     const pageTitle = await page.title();
     console.log(`TimesJobs: page title = "${pageTitle}"`);
 
-    // TimesJobs job cards
-    await page.waitForSelector('li.clearfix.job-bx, .job-bx, [class*="job-bx"]', { timeout: 15000 }).catch(() => {});
+    // Log classes to see what's on the page
+    const classes = await page.evaluate(() => {
+      const els = document.querySelectorAll('[class]');
+      const found = new Set();
+      els.forEach(el => {
+        el.className.toString().split(' ').forEach(c => {
+          if (c && c.toLowerCase().includes('job')) found.add(c);
+        });
+      });
+      return [...found].slice(0, 20).join(', ');
+    });
+    console.log(`TimesJobs: job-related classes = ${classes}`);
 
-    const cards = await page.$$('li.clearfix.job-bx, .job-bx');
+    let cards = [];
+    for (const sel of [
+      'li.clearfix.job-bx', '.job-bx', '[class*="job-bx"]',
+      'ul.new-joblist li', '.joblist-comp-name', 'li[class*="job"]',
+      '[class*="jobTuple"]', '[class*="job-tuple"]', '.srp-jobtuple-wrapper'
+    ]) {
+      cards = await page.$$(sel);
+      if (cards.length > 0) { console.log(`TimesJobs: using "${sel}", found ${cards.length} cards`); break; }
+    }
+
     console.log(`TimesJobs: found ${cards.length} cards for "${role}" in "${location}"`);
 
     for (const card of cards.slice(0, maxJobs)) {
       try {
-        const title = await card.$eval('h2 a, .job-title a, h2', el => el.textContent.trim()).catch(() => null);
+        const title = await card.$eval('h2 a, h2, h3 a, h3, .job-title, [class*="title"] a', el => el.textContent.trim()).catch(() => null);
         if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
-
-        const company = await card.$eval('.joblist-comp-name, [class*="comp-name"], h3.joblist-comp-name', el => el.textContent.trim()).catch(() => 'Unknown Company');
-        const locationText = await card.$eval('.srp-skills, [class*="location"], .loc', el => el.textContent.trim()).catch(() => location);
-        const jobUrl = await card.$eval('h2 a, a.job-title', el => el.href).catch(() => null);
-
+        const company = await card.$eval('.joblist-comp-name, [class*="comp-name"], [class*="company"]', el => el.textContent.trim()).catch(() => 'Unknown');
+        const jobUrl = await card.$eval('h2 a, h3 a, a[href*="job"]', el => el.href).catch(() => null);
         if (!jobUrl) continue;
-        jobs.push({ title, company, location: locationText, url: jobUrl, description: `${title} at ${company} in ${locationText}. Apply on TimesJobs.` });
+        jobs.push({ title, company, location, url: jobUrl, description: `${title} at ${company} in ${location}. Apply on TimesJobs.` });
         if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
+
+    // Fallback: grab links directly
+    if (jobs.length === 0) {
+      console.log('TimesJobs: trying link fallback');
+      const links = await page.$$('a[href*="timesjobs"], a[href*="job-detail"]');
+      console.log(`TimesJobs: found ${links.length} job links`);
+      for (const link of links.slice(0, maxJobs * 3)) {
+        try {
+          const text = (await link.textContent() || '').trim();
+          if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
+          const href = await link.getAttribute('href');
+          if (!href || href === '#') continue;
+          const jobUrl = href.startsWith('http') ? href : `https://www.timesjobs.com${href}`;
+          jobs.push({ title: text, company: 'See listing', location, url: jobUrl, description: `${text} - Apply on TimesJobs.` });
+          if (jobs.length >= maxJobs) break;
+        } catch (_) {}
+      }
+    }
+
     console.log(`TimesJobs: returning ${jobs.length} jobs`);
   } catch (err) { console.error(`TimesJobs error:`, err.message); }
   return jobs;
@@ -170,9 +203,9 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
 // ─── Company Career Pages ─────────────────────────────────────────────────────
 
 const COMPANY_CAREERS = [
-  { name: 'Infosys',   url: 'https://career.infosys.com/joblist',        origin: 'https://career.infosys.com' },
-  { name: 'Wipro',     url: 'https://careers.wipro.com/careers-home/',    origin: 'https://careers.wipro.com' },
-  { name: 'Cognizant', url: 'https://careers.cognizant.com/global/en',    origin: 'https://careers.cognizant.com' },
+  { name: 'Infosys',   url: 'https://career.infosys.com/joblist',       origin: 'https://career.infosys.com' },
+  { name: 'Wipro',     url: 'https://careers.wipro.com/careers-home/',   origin: 'https://careers.wipro.com' },
+  { name: 'Cognizant', url: 'https://careers.cognizant.com/global/en',   origin: 'https://careers.cognizant.com' },
 ];
 
 async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords) {
@@ -186,7 +219,6 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
         const searchBox = await page.$('input[type="search"], input[placeholder*="search" i], input[name*="keyword" i], input[placeholder*="job" i]');
         if (searchBox) { await searchBox.fill(role); await page.keyboard.press('Enter'); await sleep(2000); }
       } catch (_) {}
-
       const links = await page.$$('a[href]');
       for (const link of links.slice(0, 100)) {
         try {
@@ -197,8 +229,7 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
             textLower.includes('engineer') || textLower.includes('developer') ||
             textLower.includes('software') || textLower.includes('analyst') ||
             textLower.includes('architect') || textLower.includes('consultant') ||
-            href.includes('job') || href.includes('career') || href.includes('position') ||
-            href.includes('opening') || href.includes('vacancy');
+            href.includes('job') || href.includes('career') || href.includes('position');
           if (!isJobLink || text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const rawHref = await link.getAttribute('href');
           if (!rawHref) continue;
@@ -213,8 +244,6 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
   }
   return jobs;
 }
-
-// ─── Deduplicate ──────────────────────────────────────────────────────────────
 
 function deduplicateJobs(jobs) {
   const seen = new Set();
@@ -251,10 +280,7 @@ app.post('/indeed-jobs', async (req, res) => {
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
-    const page = await (await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    })).newPage();
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' });
+    const page = await (await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' })).newPage();
     for (const search of searches) {
       for (const location of (search.locations || [])) {
         console.log(`Indeed: scraping "${search.role}" in "${location}"`);
@@ -274,10 +300,7 @@ app.post('/google-jobs', async (req, res) => {
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
-    const page = await (await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    })).newPage();
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+    const page = await (await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' })).newPage();
     for (const search of searches) {
       for (const location of (search.locations || [])) {
         console.log(`Google Jobs: scraping "${search.role}" in "${location}"`);
@@ -310,8 +333,6 @@ app.post('/company-jobs', async (req, res) => {
     res.json(allJobs);
   } catch (err) { if (browser) await browser.close().catch(() => {}); res.status(500).json({ error: err.message }); }
 });
-
-// ─── Auto Apply ───────────────────────────────────────────────────────────────
 
 app.post('/auto-apply', async (req, res) => {
   const { jobUrl, platform, candidate, jobTitle, company } = req.body;
