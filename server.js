@@ -48,8 +48,7 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// Shine.com - FIXED using exact class names confirmed from Railway logs
-// Logs showed: jdbigCard, jobCardNova_bigCardTopTitleHeading, jobCardNova_bigCardTopCompany
+// Shine.com - working
 async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
@@ -66,7 +65,6 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
 
     await page.waitForSelector('.jdbigCard, [class*="jdbigCard"], [class*="bigCard"]', { timeout: 10000 }).catch(() => {});
 
-    // Use exact selectors confirmed from Railway logs
     let cards = [];
     for (const sel of [
       '.jdbigCard', '[class*="jdbigCard"]', '[class*="bigCard"]',
@@ -81,20 +79,17 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
     for (const card of cards) {
       if (jobs.length >= maxJobs) break;
       try {
-        // Exact class from logs: jobCardNova_bigCardTopTitleHeading__Rj2sC
         const title = await card.$eval(
           '[class*="bigCardTopTitleHeading"], [class*="TitleHeading"], [class*="jdBigCardTopTitle"] h2, h2, h3',
           el => el.textContent.trim()
         ).catch(() => null);
         if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
 
-        // Exact class from logs: jobCardNova_bigCardTopCompany__YuMwg
         const company = await card.$eval(
           '[class*="bigCardTopCompany"], [class*="TopCompany"], [class*="company"]',
           el => el.textContent.trim()
         ).catch(() => 'Unknown');
 
-        // Get job URL from anchor
         const jobUrl = await card.$eval(
           'a[href*="/job-detail/"], a[href*="shine.com/jobs"], a[href*="/jobs/"]',
           el => el.href
@@ -106,7 +101,6 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
       } catch (_) {}
     }
 
-    // Fallback: grab job detail links directly
     if (jobs.length === 0) {
       console.log('Shine: trying link fallback');
       const links = await page.$$('a[href*="/job-detail/"]');
@@ -116,7 +110,6 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
         try {
           const href = await link.getAttribute('href');
           if (!href || href === '#') continue;
-          // Get title from nearest heading inside or around the link
           const text = (await link.evaluate(el => {
             const heading = el.closest('[class*="bigCard"]')?.querySelector('[class*="TitleHeading"], h2, h3');
             return heading ? heading.textContent.trim() : el.textContent.trim();
@@ -133,7 +126,7 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// Foundit (Monster India) - replaces Naukri which gives Access Denied on Railway
+// Foundit (Monster India) - currently Access Denied on Railway IP
 async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
@@ -150,7 +143,6 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
 
     await page.waitForSelector('.jobsearchresults, [class*="cardContainer"], [class*="jobCard"], .job-container', { timeout: 10000 }).catch(() => {});
 
-    // Log actual classes on page
     const classes = await page.evaluate(() => {
       const els = document.querySelectorAll('[class]');
       const found = new Set();
@@ -201,7 +193,6 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
       } catch (_) {}
     }
 
-    // Fallback: grab all job links
     if (jobs.length === 0) {
       console.log('Foundit: trying link fallback');
       const links = await page.$$('a[href*="/job/"], a[href*="foundit.in/srp"]');
@@ -224,12 +215,40 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
   return jobs;
 }
 
-// Company Career Pages (unchanged - working)
+// Company Career Pages - FIXED: filter was matching login/register/about pages
+// because it accepted ANY link containing "career" in the href. Now requires
+// real job-title-shaped text AND excludes known non-job paths (login, register,
+// signin, sign-up, about, contact, faq, privacy, terms, help, support).
 const COMPANY_CAREERS = [
   { name: 'Infosys',   url: 'https://career.infosys.com/joblist',       origin: 'https://career.infosys.com' },
   { name: 'Wipro',     url: 'https://careers.wipro.com/careers-home/',   origin: 'https://careers.wipro.com' },
   { name: 'Cognizant', url: 'https://careers.cognizant.com/global/en',   origin: 'https://careers.cognizant.com' },
 ];
+
+const NON_JOB_PATH_PATTERNS = [
+  'login', 'logout', 'signin', 'sign-in', 'signup', 'sign-up', 'register',
+  'account', 'profile', 'about', 'contact', 'faq', 'privacy', 'terms',
+  'help', 'support', 'cookie', 'feedback', 'unsubscribe', 'home', 'index'
+];
+
+// A real job title is usually 3+ words and contains a role-shaped word.
+// This is stricter than the old check, which matched on the URL alone.
+function looksLikeJobTitle(text) {
+  const t = text.trim();
+  if (t.length < 8) return false;
+  const wordCount = t.split(/\s+/).length;
+  if (wordCount < 2) return false;
+  const roleWords = ['engineer', 'developer', 'software', 'analyst', 'architect',
+    'consultant', 'manager', 'specialist', 'lead', 'intern', 'associate',
+    'designer', 'administrator', 'scientist', 'tester', 'qa', 'devops'];
+  const tl = t.toLowerCase();
+  return roleWords.some(w => tl.includes(w));
+}
+
+function isNonJobPath(href) {
+  const h = href.toLowerCase();
+  return NON_JOB_PATH_PATTERNS.some(p => h.includes(p));
+}
 
 async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
@@ -243,19 +262,20 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
         if (searchBox) { await searchBox.fill(role); await page.keyboard.press('Enter'); await sleep(2000); }
       } catch (_) {}
       const links = await page.$$('a[href]');
-      for (const link of links.slice(0, 100)) {
+      for (const link of links.slice(0, 150)) {
         try {
           const text = (await link.textContent() || '').trim();
-          const href = (await link.getAttribute('href') || '').toLowerCase();
-          const textLower = text.toLowerCase();
-          const isJobLink =
-            textLower.includes('engineer') || textLower.includes('developer') ||
-            textLower.includes('software') || textLower.includes('analyst') ||
-            textLower.includes('architect') || textLower.includes('consultant') ||
-            href.includes('job') || href.includes('career') || href.includes('position');
-          if (!isJobLink || text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const rawHref = await link.getAttribute('href');
           if (!rawHref) continue;
+          const hrefLower = rawHref.toLowerCase();
+
+          // Reject obvious non-job pages first, regardless of text match
+          if (isNonJobPath(hrefLower)) continue;
+
+          // Require the link TEXT to actually look like a job title,
+          // not just the URL containing "career" or "job"
+          if (!looksLikeJobTitle(text) || shouldExclude(text, excludeKeywords)) continue;
+
           const jobUrl = rawHref.startsWith('http') ? rawHref : `${company.origin}${rawHref.startsWith('/') ? '' : '/'}${rawHref}`;
           companyJobs.push({ title: text, company: company.name, location, url: jobUrl, description: `${text} at ${company.name}` });
           if (companyJobs.length >= maxJobs) break;
@@ -369,9 +389,6 @@ app.post('/auto-apply', async (req, res) => {
   const jobTitle = body.jobTitle;
   const company = body.company;
 
-  // Accept BOTH formats:
-  // Format 1 — nested: { candidate: { email, fullName } }
-  // Format 2 — flat from n8n: { candidateEmail, candidateFullName, ... }
   const candidate = body.candidate || {
     email: body.candidateEmail || body.email || '',
     fullName: body.candidateFullName || body.fullName || '',
@@ -386,13 +403,36 @@ app.post('/auto-apply', async (req, res) => {
   if (!jobUrl || !candidate.email) {
     return res.status(400).json({ error: 'jobUrl and candidate email required', received: { jobUrl, email: candidate.email } });
   }
+
+  // Reject known non-job URLs outright, before even launching a browser.
+  // This is the same filter used in scrapeCompanyJobs, applied defensively
+  // here too in case a bad URL slips through from any source.
+  if (isNonJobPath(jobUrl)) {
+    console.log(`Auto Apply: rejected - URL looks like a login/register/info page, not a job: ${jobUrl}`);
+    return res.json({
+      success: false,
+      message: 'URL does not appear to be a real job posting (login/register/info page)',
+      platform, jobUrl, appliedAt: new Date().toISOString()
+    });
+  }
+
   try {
     browser = await launchBrowser();
     const page = await (await browser.newContext({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' })).newPage();
-    if (platform === 'linkedin') await applyLinkedIn(page, jobUrl, candidate);
-    else if (platform === 'indeed') await applyIndeed(page, jobUrl, candidate);
-    else await applyGeneric(page, jobUrl, candidate);
+    let result;
+    if (platform === 'linkedin') result = await applyLinkedIn(page, jobUrl, candidate);
+    else if (platform === 'indeed') result = await applyIndeed(page, jobUrl, candidate);
+    else result = await applyGeneric(page, jobUrl, candidate);
     await browser.close();
+
+    if (!result || result.submitted !== true) {
+      // No real submission happened - report honestly instead of a blind success
+      return res.json({
+        success: false,
+        message: (result && result.reason) || 'No application form/submit action found on page',
+        platform, jobUrl, appliedAt: new Date().toISOString()
+      });
+    }
     res.json({ success: true, message: `Applied to ${jobTitle} at ${company}`, platform, jobUrl, appliedAt: new Date().toISOString() });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -404,39 +444,69 @@ async function applyLinkedIn(page, jobUrl, candidate) {
   await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
   const btn = await page.$('button.jobs-apply-button, button[aria-label*="Easy Apply"]');
-  if (!btn) throw new Error('No Easy Apply button found');
+  if (!btn) return { submitted: false, reason: 'No Easy Apply button found' };
   await btn.click(); await sleep(2000);
   await fillField(page, 'input[name="phoneNumber"], input[id*="phone"]', candidate.phone || '');
   await fillField(page, 'input[id*="email"]', candidate.email);
+  let submitted = false;
   for (let i = 0; i < 5; i++) {
     const submit = await page.$('button[aria-label="Submit application"]');
-    if (submit) { await submit.click(); await sleep(2000); break; }
+    if (submit) { await submit.click(); await sleep(2000); submitted = true; break; }
     const next = await page.$('button[aria-label="Continue to next step"], button[aria-label="Review your application"]');
     if (next) { await next.click(); await sleep(1500); } else break;
   }
+  return { submitted, reason: submitted ? null : 'Could not reach final submit step' };
 }
 
 async function applyIndeed(page, jobUrl, candidate) {
   await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
   const btn = await page.$('button[id*="apply"], a[id*="apply"], button[class*="apply"]');
-  if (!btn) throw new Error('No apply button found');
+  if (!btn) return { submitted: false, reason: 'No apply button found' };
   await btn.click(); await sleep(2000);
   await fillField(page, 'input[name="email"], input[type="email"]', candidate.email);
   await fillField(page, 'input[name="name"], input[id*="name"]', candidate.fullName || '');
   const submit = await page.$('button[type="submit"], button[id*="submit"]');
-  if (submit) await submit.click();
+  if (!submit) return { submitted: false, reason: 'No submit button found after clicking apply' };
+  await submit.click();
+  return { submitted: true, reason: null };
 }
 
+// FIXED: previously this always returned success because it never threw,
+// even if it never found an apply button. Now it tracks whether an apply
+// button AND a submit action both actually happened, and reports that.
 async function applyGeneric(page, jobUrl, candidate) {
   await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
+
+  let clickedApply = false;
   for (const sel of ['a[href*="apply"]', 'button:has-text("Apply")', 'a:has-text("Apply Now")', '[class*="apply"]', '[id*="apply"]']) {
-    try { await page.click(sel, { timeout: 3000 }); await sleep(2000); break; } catch (_) {}
+    try { await page.click(sel, { timeout: 3000 }); await sleep(2000); clickedApply = true; break; } catch (_) {}
+  }
+
+  if (!clickedApply) {
+    return { submitted: false, reason: 'No apply button/link found on page - likely not a real job posting' };
+  }
+
+  const emailField = await page.$('input[type="email"], input[name="email"]');
+  if (!emailField) {
+    return { submitted: false, reason: 'No application form appeared after clicking apply' };
   }
   await fillField(page, 'input[type="email"], input[name="email"]', candidate.email);
   await fillField(page, 'input[name="name"], input[name="fullName"], input[id*="name"]', candidate.fullName || '');
   if (candidate.coverLetter) await fillField(page, 'textarea[name*="cover"], textarea[id*="cover"]', candidate.coverLetter);
+
+  const submitBtn = await page.$('button[type="submit"], input[type="submit"], button[id*="submit"], button:has-text("Submit")');
+  if (!submitBtn) {
+    return { submitted: false, reason: 'Form filled but no submit button found' };
+  }
+  try {
+    await submitBtn.click();
+    await sleep(2000);
+    return { submitted: true, reason: null };
+  } catch (e) {
+    return { submitted: false, reason: `Submit click failed: ${e.message}` };
+  }
 }
 
 async function fillField(page, selector, value) {
