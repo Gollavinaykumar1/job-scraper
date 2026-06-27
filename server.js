@@ -21,8 +21,7 @@ function shouldExclude(title, excludeKeywords = []) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── LinkedIn ─────────────────────────────────────────────────────────────────
-
+// LinkedIn (unchanged - working)
 async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
@@ -49,9 +48,8 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Shine.com Scraper (replaces Indeed / Fresherworld) ──────────────────────
-// Shine.com — major Indian job portal, no IP blocking, domcontentloaded works
-
+// Shine.com - FIXED using exact class names confirmed from Railway logs
+// Logs showed: jdbigCard, jobCardNova_bigCardTopTitleHeading, jobCardNova_bigCardTopCompany
 async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
@@ -66,58 +64,66 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
     const pageTitle = await page.title();
     console.log(`Shine: page title = "${pageTitle}"`);
 
-    await page.waitForSelector('.jobCard, .job-card, [class*="jobCard"], [class*="job-card"], .srpJobCard', { timeout: 10000 }).catch(() => {});
+    await page.waitForSelector('.jdbigCard, [class*="jdbigCard"], [class*="bigCard"]', { timeout: 10000 }).catch(() => {});
 
-    const classes = await page.evaluate(() => {
-      const els = document.querySelectorAll('[class]');
-      const found = new Set();
-      els.forEach(el => {
-        el.className.toString().split(' ').forEach(c => {
-          if (c && (c.toLowerCase().includes('job') || c.toLowerCase().includes('card'))) found.add(c);
-        });
-      });
-      return [...found].slice(0, 20).join(', ');
-    });
-    console.log(`Shine: job-related classes = ${classes}`);
-
+    // Use exact selectors confirmed from Railway logs
     let cards = [];
     for (const sel of [
-      '.jobCard', '.srpJobCard', '[class*="jobCard"]', '[class*="job-card"]',
-      '.job-card', 'article[class*="job"]', 'li[class*="job"]',
-      '[data-jobid]', '.shine-job', '.jobItem', '.job_list_item'
+      '.jdbigCard', '[class*="jdbigCard"]', '[class*="bigCard"]',
+      '[class*="jobCardNova"]', '[class*="jobCard"]'
     ]) {
       cards = await page.$$(sel);
       if (cards.length > 0) { console.log(`Shine: using "${sel}", found ${cards.length} cards`); break; }
     }
 
-    console.log(`Shine: found ${cards.length} cards`);
+    console.log(`Shine: total cards = ${cards.length}`);
 
-    for (const card of cards.slice(0, maxJobs)) {
+    for (const card of cards) {
+      if (jobs.length >= maxJobs) break;
       try {
-        const title = await card.$eval('h2, h3, [class*="title"], [class*="jobtitle"], a[href*="job"]', el => el.textContent.trim()).catch(() => null);
+        // Exact class from logs: jobCardNova_bigCardTopTitleHeading__Rj2sC
+        const title = await card.$eval(
+          '[class*="bigCardTopTitleHeading"], [class*="TitleHeading"], [class*="jdBigCardTopTitle"] h2, h2, h3',
+          el => el.textContent.trim()
+        ).catch(() => null);
         if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
-        const company = await card.$eval('[class*="company"], [class*="employer"], [class*="comp"]', el => el.textContent.trim()).catch(() => 'Unknown');
-        const jobUrl = await card.$eval('a', el => el.href).catch(() => null);
+
+        // Exact class from logs: jobCardNova_bigCardTopCompany__YuMwg
+        const company = await card.$eval(
+          '[class*="bigCardTopCompany"], [class*="TopCompany"], [class*="company"]',
+          el => el.textContent.trim()
+        ).catch(() => 'Unknown');
+
+        // Get job URL from anchor
+        const jobUrl = await card.$eval(
+          'a[href*="/job-detail/"], a[href*="shine.com/jobs"], a[href*="/jobs/"]',
+          el => el.href
+        ).catch(() => null);
         if (!jobUrl) continue;
+
         const fullUrl = jobUrl.startsWith('http') ? jobUrl : `https://www.shine.com${jobUrl}`;
         jobs.push({ title, company, location, url: fullUrl, description: `${title} at ${company} in ${location}. Apply on Shine.` });
-        if (jobs.length >= maxJobs) break;
       } catch (_) {}
     }
 
+    // Fallback: grab job detail links directly
     if (jobs.length === 0) {
       console.log('Shine: trying link fallback');
-      const links = await page.$$('a[href*="/job-detail/"], a[href*="/jobs/"]');
-      console.log(`Shine: found ${links.length} job links`);
-      for (const link of links.slice(0, maxJobs * 3)) {
+      const links = await page.$$('a[href*="/job-detail/"]');
+      console.log(`Shine: found ${links.length} job detail links`);
+      for (const link of links) {
+        if (jobs.length >= maxJobs) break;
         try {
-          const text = (await link.textContent() || '').trim();
-          if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const href = await link.getAttribute('href');
           if (!href || href === '#') continue;
+          // Get title from nearest heading inside or around the link
+          const text = (await link.evaluate(el => {
+            const heading = el.closest('[class*="bigCard"]')?.querySelector('[class*="TitleHeading"], h2, h3');
+            return heading ? heading.textContent.trim() : el.textContent.trim();
+          }) || '').trim();
+          if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const jobUrl = href.startsWith('http') ? href : `https://www.shine.com${href}`;
           jobs.push({ title: text, company: 'See listing', location, url: jobUrl, description: `${text} - Apply on Shine.` });
-          if (jobs.length >= maxJobs) break;
         } catch (_) {}
       }
     }
@@ -127,87 +133,98 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── Naukri.com Scraper (replaces Google Jobs / TimesJobs) ───────────────────
-// Naukri — India's largest job portal, domcontentloaded + 3s wait is enough
-
+// Foundit (Monster India) - replaces Naukri which gives Access Denied on Railway
 async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    const roleSlug = role.toLowerCase().replace(/\s+/g, '-');
-    const locSlug = location.toLowerCase().replace(/\s+/g, '-');
-    const url = `https://www.naukri.com/${roleSlug}-jobs-in-${locSlug}`;
+    const query = encodeURIComponent(role);
+    const loc = encodeURIComponent(location);
+    const url = `https://www.foundit.in/srp/results?query=${query}&location=${loc}&experienceRanges=0~3`;
 
-    console.log(`Naukri: loading "${role}" in "${location}"`);
+    console.log(`Foundit: loading "${role}" in "${location}"`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(3000);
 
     const pageTitle = await page.title();
-    console.log(`Naukri: page title = "${pageTitle}"`);
+    console.log(`Foundit: page title = "${pageTitle}"`);
 
-    await page.waitForSelector('article.jobTuple, .jobTuple, [class*="jobTuple"], .srp-jobtuple-wrapper', { timeout: 10000 }).catch(() => {});
+    await page.waitForSelector('.jobsearchresults, [class*="cardContainer"], [class*="jobCard"], .job-container', { timeout: 10000 }).catch(() => {});
 
+    // Log actual classes on page
     const classes = await page.evaluate(() => {
       const els = document.querySelectorAll('[class]');
       const found = new Set();
       els.forEach(el => {
         el.className.toString().split(' ').forEach(c => {
-          if (c && (c.toLowerCase().includes('job') || c.toLowerCase().includes('tuple') || c.toLowerCase().includes('card'))) found.add(c);
+          if (c && (c.toLowerCase().includes('job') || c.toLowerCase().includes('card') || c.toLowerCase().includes('result'))) found.add(c);
         });
       });
-      return [...found].slice(0, 20).join(', ');
+      return [...found].slice(0, 25).join(', ');
     });
-    console.log(`Naukri: job-related classes = ${classes}`);
+    console.log(`Foundit: job-related classes = ${classes}`);
 
     let cards = [];
     for (const sel of [
-      'article.jobTuple', '.jobTuple', '[class*="jobTuple"]',
-      '.srp-jobtuple-wrapper', '[class*="srp-jobtuple"]',
-      '.cust-job-tuple', 'article[class*="job"]',
-      '.job-tuple', '[class*="job-tuple"]', 'li.jobTupleHeader'
+      '[class*="cardContainer"]', '[class*="jobCard"]', '[class*="card-container"]',
+      '.jobsearchresults article', '[class*="job-card"]', '[class*="JobCard"]',
+      '.srp-jobtuple', 'article[class*="job"]', '[class*="jobItem"]',
+      '[class*="listItem"]', '[data-job-id]', '[class*="resultItem"]'
     ]) {
       cards = await page.$$(sel);
-      if (cards.length > 0) { console.log(`Naukri: using "${sel}", found ${cards.length} cards`); break; }
+      if (cards.length > 0) { console.log(`Foundit: using "${sel}", found ${cards.length} cards`); break; }
     }
 
-    console.log(`Naukri: found ${cards.length} cards`);
+    console.log(`Foundit: total cards = ${cards.length}`);
 
-    for (const card of cards.slice(0, maxJobs)) {
+    for (const card of cards) {
+      if (jobs.length >= maxJobs) break;
       try {
-        const title = await card.$eval('a.title, .title, h2 a, h2, [class*="title"] a', el => el.textContent.trim()).catch(() => null);
+        const title = await card.$eval(
+          '[class*="title"], [class*="jobTitle"], [class*="job-title"], h2, h3, a[href*="job"]',
+          el => el.textContent.trim()
+        ).catch(() => null);
         if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
-        const company = await card.$eval('.companyInfo a, [class*="company"] a, [class*="comp-name"]', el => el.textContent.trim()).catch(() => 'Unknown');
-        const jobUrl = await card.$eval('a.title, a[href*="naukri.com"], a[href*="job-listings"]', el => el.href).catch(() => null);
+
+        const company = await card.$eval(
+          '[class*="company"], [class*="companyName"], [class*="employer"]',
+          el => el.textContent.trim()
+        ).catch(() => 'Unknown');
+
+        const jobUrl = await card.$eval(
+          'a[href*="foundit.in"], a[href*="/job/"], a[href*="monster"], a',
+          el => el.href
+        ).catch(() => null);
         if (!jobUrl) continue;
-        const fullUrl = jobUrl.startsWith('http') ? jobUrl : `https://www.naukri.com${jobUrl}`;
-        jobs.push({ title, company, location, url: fullUrl, description: `${title} at ${company} in ${location}. Apply on Naukri.` });
-        if (jobs.length >= maxJobs) break;
+
+        const fullUrl = jobUrl.startsWith('http') ? jobUrl : `https://www.foundit.in${jobUrl}`;
+        jobs.push({ title, company, location, url: fullUrl, description: `${title} at ${company} in ${location}. Apply on Foundit.` });
       } catch (_) {}
     }
 
+    // Fallback: grab all job links
     if (jobs.length === 0) {
-      console.log('Naukri: trying link fallback');
-      const links = await page.$$('a[href*="naukri.com"][href*="job-listings"], a[href*="/job-listings-"]');
-      console.log(`Naukri: found ${links.length} job links`);
-      for (const link of links.slice(0, maxJobs * 3)) {
+      console.log('Foundit: trying link fallback');
+      const links = await page.$$('a[href*="/job/"], a[href*="foundit.in/srp"]');
+      console.log(`Foundit: found ${links.length} job links`);
+      for (const link of links) {
+        if (jobs.length >= maxJobs) break;
         try {
           const text = (await link.textContent() || '').trim();
           if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const href = await link.getAttribute('href');
           if (!href || href === '#') continue;
-          const jobUrl = href.startsWith('http') ? href : `https://www.naukri.com${href}`;
-          jobs.push({ title: text, company: 'See listing', location, url: jobUrl, description: `${text} - Apply on Naukri.` });
-          if (jobs.length >= maxJobs) break;
+          const jobUrl = href.startsWith('http') ? href : `https://www.foundit.in${href}`;
+          jobs.push({ title: text, company: 'See listing', location, url: jobUrl, description: `${text} - Apply on Foundit.` });
         } catch (_) {}
       }
     }
 
-    console.log(`Naukri: returning ${jobs.length} jobs`);
-  } catch (err) { console.error(`Naukri error:`, err.message); }
+    console.log(`Foundit: returning ${jobs.length} jobs`);
+  } catch (err) { console.error(`Foundit error:`, err.message); }
   return jobs;
 }
 
-// ─── Company Career Pages ─────────────────────────────────────────────────────
-
+// Company Career Pages (unchanged - working)
 const COMPANY_CAREERS = [
   { name: 'Infosys',   url: 'https://career.infosys.com/joblist',       origin: 'https://career.infosys.com' },
   { name: 'Wipro',     url: 'https://careers.wipro.com/careers-home/',   origin: 'https://careers.wipro.com' },
@@ -256,8 +273,7 @@ function deduplicateJobs(jobs) {
   return jobs.filter(j => { if (seen.has(j.url)) return false; seen.add(j.url); return true; });
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
+// Routes
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
 app.post('/linkedin-jobs', async (req, res) => {
