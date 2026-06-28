@@ -205,8 +205,16 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
             return heading ? heading.textContent.trim() : el.textContent.trim();
           }) || '').trim();
           if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
+          // Try to find a real company name near the link before giving up
+          // and falling back to a placeholder.
+          const companyName = (await link.evaluate(el => {
+            const card = el.closest('[class*="bigCard"]');
+            if (!card) return null;
+            const candidate = card.querySelector('[class*="company" i], [class*="Company"]');
+            return candidate ? candidate.textContent.trim() : null;
+          }) || '').trim();
           const jobUrl = href.startsWith('http') ? href : `https://www.shine.com${href}`;
-          jobs.push({ title: text, company: 'See listing', location, url: jobUrl, description: `${text} - Apply on Shine.` });
+          jobs.push({ title: text, company: companyName || 'Unknown (see job link)', location, url: jobUrl, description: `${text} - Apply on Shine.` });
         } catch (_) {}
       }
     }
@@ -294,8 +302,16 @@ async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) 
           if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const href = await link.getAttribute('href');
           if (!href || href === '#') continue;
+          // Try to find a real company name near the link before giving up
+          // and falling back to a placeholder.
+          const companyName = (await link.evaluate(el => {
+            const card = el.closest('[class*="card" i], [class*="job" i], article');
+            if (!card) return null;
+            const candidate = card.querySelector('[class*="company" i], [class*="employer" i]');
+            return candidate ? candidate.textContent.trim() : null;
+          }) || '').trim();
           const jobUrl = href.startsWith('http') ? href : `https://www.foundit.in${href}`;
-          jobs.push({ title: text, company: 'See listing', location, url: jobUrl, description: `${text} - Apply on Foundit.` });
+          jobs.push({ title: text, company: companyName || 'Unknown (see job link)', location, url: jobUrl, description: `${text} - Apply on Foundit.` });
         } catch (_) {}
       }
     }
@@ -635,10 +651,47 @@ async function applyGeneric(page, jobUrl, candidate) {
     return { submitted: false, reason: 'Form filled but no submit button found' };
   }
   try {
+    const urlBeforeSubmit = page.url();
     await submitBtn.click();
-    await sleep(2000);
+    await sleep(2500);
     cleanupResumePdf(resumePdfPath);
-    return { submitted: true, reason: null };
+
+    // Verify the submission actually went through instead of assuming success
+    // just because the click didn't throw. A click can "succeed" mechanically
+    // while the form rejects it (validation error, login wall, unchanged page).
+    const urlAfterSubmit = page.url();
+    const urlChanged = urlAfterSubmit !== urlBeforeSubmit;
+
+    const errorOnPage = await page.$(
+      '[class*="error" i], [class*="invalid" i], [role="alert"], .field-error, .form-error'
+    ).catch(() => null);
+
+    const successIndicator = await page.$(
+      ':text-matches("thank you", "i"), :text-matches("application (received|submitted|complete)", "i"), :text-matches("successfully applied", "i"), [class*="success" i], [class*="confirmation" i]'
+    ).catch(() => null);
+
+    // Still showing the same submit button on the same form is a strong sign
+    // nothing actually happened (e.g. a required field was missing).
+    const formStillPresent = await page.$('button[type="submit"], input[type="submit"]').catch(() => null);
+
+    if (errorOnPage) {
+      return { submitted: false, reason: 'Form showed a validation error after submit - likely a required field was missed' };
+    }
+    if (successIndicator) {
+      return { submitted: true, reason: null };
+    }
+    if (urlChanged) {
+      // Page navigated somewhere new and no error was visible - reasonable
+      // signal of success, but flagged as unconfirmed since we didn't see an
+      // explicit success message.
+      return { submitted: true, reason: 'Submitted - page navigated after submit but no explicit confirmation message was found' };
+    }
+    if (formStillPresent) {
+      return { submitted: false, reason: 'Submit clicked but the same form is still showing - submission likely did not go through (may require account creation or additional steps)' };
+    }
+    // Page changed in some way (e.g. form disappeared) without a clear error
+    // or success signal - report as unconfirmed rather than a clean success.
+    return { submitted: false, reason: 'Submit clicked but could not confirm the application actually went through - verify manually' };
   } catch (e) {
     cleanupResumePdf(resumePdfPath);
     return { submitted: false, reason: `Submit click failed: ${e.message}` };
