@@ -13,7 +13,7 @@ async function launchBrowser() {
     args: [
       '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
       '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
-      '--single-process', '--disable-gpu'
+      '--single-process', '--disable-gpu', '--disable-blink-features=AutomationControlled'
     ]
   });
 }
@@ -28,74 +28,23 @@ function shouldExclude(title, excludeKeywords = []) {
 function deduplicateJobs(jobs) {
   const seen = new Set();
   return jobs.filter(j => {
-    const key = (j.url || '') + '|' + (j.title || '') + '|' + (j.company || '');
+    const key = (j.title || '') + '|' + (j.company || '');
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 }
 
-// Cleans up salary text - removes extra whitespace and normalises
 function cleanSalary(text) {
   if (!text) return 'Not disclosed';
   const cleaned = text.replace(/\s+/g, ' ').trim();
-  // Filter out non-salary strings that sometimes bleed in
-  if (cleaned.length < 3 || cleaned.length > 80) return 'Not disclosed';
-  if (/salary|lpa|lakh|per annum|₹|inr|ctc|pa|month|year/i.test(cleaned)) return cleaned;
+  if (cleaned.length < 3 || cleaned.length > 100) return 'Not disclosed';
+  if (/salary|lpa|lakh|per annum|₹|inr|ctc|pa|month|year|\d/i.test(cleaned)) return cleaned;
   return 'Not disclosed';
 }
 
-// Simple ATS scorer - compares resume skills against job description
-// Returns 0-100 score based on keyword overlap
-function calculateATS(resumeSkills, resumeExperience, jobTitle, jobDescription) {
-  if (!resumeSkills && !resumeExperience) return null; // no resume data
-
-  const resumeText = ((resumeSkills || '') + ' ' + (resumeExperience || '')).toLowerCase();
-  const jobText = ((jobTitle || '') + ' ' + (jobDescription || '')).toLowerCase();
-
-  // Extract meaningful words from job description (ignore stopwords)
-  const stopwords = new Set(['the','a','an','and','or','but','in','on','at','to','for',
-    'of','with','by','from','as','is','are','was','were','be','been','being',
-    'have','has','had','do','does','did','will','would','could','should','may',
-    'might','shall','can','need','must','our','your','their','we','you','they',
-    'it','this','that','these','those','who','which','what','where','when','how',
-    'all','any','both','each','few','more','most','other','some','such','than',
-    'too','very','just','about','above','after','before','between','into','through',
-    'during','including','work','working','experience','good','strong','excellent',
-    'ability','skills','knowledge','understanding','team','company','looking','role',
-    'position','join','opportunity','candidate','required','requirements','responsibilities',
-    'apply','job','hiring','recruit','description','qualification','preferred','plus','years']);
-
-  const jobWords = jobText.split(/\W+/).filter(w => w.length > 2 && !stopwords.has(w));
-  const uniqueJobWords = [...new Set(jobWords)];
-
-  // Tech/role specific terms get double weight
-  const techTerms = ['python','java','javascript','typescript','react','node','nodejs',
-    'angular','vue','sql','mysql','postgresql','mongodb','redis','aws','azure','gcp',
-    'docker','kubernetes','git','linux','api','rest','graphql','microservices','agile',
-    'scrum','spring','django','flask','express','html','css','devops','ci/cd','jenkins',
-    'terraform','ansible','kafka','spark','hadoop','machine learning','deep learning',
-    'tensorflow','pytorch','nlp','data science','data engineering','etl','tableau',
-    'powerbi','excel','c++','c#','.net','php','ruby','golang','rust','swift','kotlin',
-    'android','ios','flutter','react native','selenium','cypress','junit','jest'];
-
-  let matched = 0;
-  let total = 0;
-
-  for (const word of uniqueJobWords) {
-    if (techTerms.includes(word)) {
-      total += 2;
-      if (resumeText.includes(word)) matched += 2;
-    } else {
-      total += 1;
-      if (resumeText.includes(word)) matched += 1;
-    }
-  }
-
-  if (total === 0) return 60; // default mid-score if no extractable keywords
-  const raw = Math.round((matched / total) * 100);
-  // Clamp between 20-95 (no perfect scores, no zero scores for real jobs)
-  return Math.min(95, Math.max(20, raw));
+async function randomDelay(min = 1000, max = 3000) {
+  return sleep(Math.floor(Math.random() * (max - min) + min));
 }
 
 // ─── LINKEDIN ─────────────────────────────────────────────────────────────────
@@ -106,69 +55,24 @@ function getLinkedInStorageState() {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-async function newLinkedInContext(browser) {
-  const storageState = getLinkedInStorageState();
-  const opts = {
-    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36'
-  };
-  if (storageState) opts.storageState = storageState;
-  return await browser.newContext(opts);
-}
-
-// Scrapes the actual job detail page to get real description
-async function fetchLinkedInJobDetail(page, url) {
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await sleep(1500);
-
-    const description = await page.$eval(
-      '.show-more-less-html__markup, .description__text, [class*="description"] .show-more-less-html',
-      el => el.innerText.trim()
-    ).catch(() => null);
-
-    const salary = await page.$eval(
-      '.compensation__salary, [class*="salary"], .salary-range, .compensation-range',
-      el => el.innerText.trim()
-    ).catch(() => null);
-
-    const experienceLevel = await page.$eval(
-      '.description__job-criteria-text',
-      el => el.innerText.trim()
-    ).catch(() => null);
-
-    return {
-      description: description || null,
-      salary: cleanSalary(salary),
-      experienceLevel: experienceLevel || 'Entry level'
-    };
-  } catch (err) {
-    console.error(`LinkedIn detail fetch error: ${err.message}`);
-    return { description: null, salary: 'Not disclosed', experienceLevel: 'Entry level' };
-  }
-}
-
 async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    // f_E=2%2C3 = Entry level + Associate; f_TPR=r86400 = last 24h; sortBy=DD = most recent
     const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(role)}&location=${encodeURIComponent(location)}&f_TPR=r604800&f_E=2%2C3&sortBy=DD`;
-    console.log(`LinkedIn: loading ${url}`);
+    console.log(`LinkedIn: loading "${role}" in "${location}"`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2000);
+    await sleep(2500);
 
-    // Accept cookies if prompted
     try { await page.click('button[action-type="ACCEPT"]', { timeout: 3000 }); await sleep(500); } catch (_) {}
 
-    // Scroll to load more cards
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
       await page.evaluate(() => window.scrollBy(0, 600));
-      await sleep(800);
+      await sleep(700);
     }
 
     await page.waitForSelector('.job-card-container, .base-card', { timeout: 15000 }).catch(() => {});
-
     const cards = await page.$$('.job-card-container, .base-card');
-    console.log(`LinkedIn: found ${cards.length} cards for "${role}" in "${location}"`);
+    console.log(`LinkedIn: found ${cards.length} cards`);
 
     for (const card of cards) {
       if (jobs.length >= maxJobs) break;
@@ -177,16 +81,15 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
           '.job-card-list__title, .base-search-card__title, [class*="job-card-list__title"]',
           el => el.innerText.trim()
         ).catch(() => null);
-
         if (!title || shouldExclude(title, excludeKeywords)) continue;
 
         const company = await card.$eval(
-          '.job-card-container__primary-description, .base-search-card__subtitle, [class*="primary-description"]',
+          '.job-card-container__primary-description, .base-search-card__subtitle',
           el => el.innerText.trim()
-        ).catch(() => 'Unknown Company');
+        ).catch(() => 'Unknown');
 
         const locationText = await card.$eval(
-          '.job-card-container__metadata-item, .job-search-card__location, [class*="metadata-item"]',
+          '.job-card-container__metadata-item, .job-search-card__location',
           el => el.innerText.trim()
         ).catch(() => location);
 
@@ -194,197 +97,292 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
           'a.job-card-list__title, a.base-card__full-link, a[class*="base-card__full-link"]',
           el => el.href
         ).catch(() => null);
-
         if (!jobUrl) continue;
 
-        // Get salary from card if available
-        const salaryFromCard = await card.$eval(
+        const salary = await card.$eval(
           '.job-card-container__salary-info, [class*="salary"]',
           el => el.innerText.trim()
         ).catch(() => null);
 
         const postedDate = await card.$eval(
-          'time, .job-card-container__listdate, [class*="listdate"]',
+          'time, .job-card-container__listdate',
           el => el.getAttribute('datetime') || el.innerText.trim()
         ).catch(() => new Date().toISOString());
 
         jobs.push({
-          title,
-          company,
+          title, company,
           location: locationText,
           url: jobUrl,
-          salary: cleanSalary(salaryFromCard),
+          salary: cleanSalary(salary),
           postedDate,
           source: 'LinkedIn',
-          description: null, // fetched separately below
+          description: `${title} at ${company} in ${locationText}`,
           experienceLevel: 'Entry level'
         });
       } catch (_) {}
     }
-
-    // Fetch real descriptions for each job (up to maxJobs)
-    console.log(`LinkedIn: fetching details for ${jobs.length} jobs...`);
-    for (const job of jobs) {
-      try {
-        const detail = await fetchLinkedInJobDetail(page, job.url);
-        if (detail.description) job.description = detail.description.substring(0, 1500);
-        if (detail.salary !== 'Not disclosed') job.salary = detail.salary;
-        job.experienceLevel = detail.experienceLevel;
-        await sleep(1000);
-      } catch (_) {}
-    }
-
   } catch (err) {
-    console.error(`LinkedIn scrape error: ${err.message}`);
+    console.error(`LinkedIn error: ${err.message}`);
   }
   return jobs;
 }
 
-// ─── NAUKRI (replaces Shine/Indeed) ───────────────────────────────────────────
-// Naukri.com is India's largest job portal and DOES show real salary, 
-// experience, and company data in listing cards - far better than Shine.
+// ─── NAUKRI ───────────────────────────────────────────────────────────────────
+// Uses the Naukri JSON API directly — no scraping, no blocks
 
 async function scrapeNaukri(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    const roleSlug = encodeURIComponent(role);
-    const locSlug = encodeURIComponent(location);
-    // experienceRange=0 means fresher/entry level
-    const url = `https://www.naukri.com/${role.toLowerCase().replace(/\s+/g,'-')}-jobs-in-${location.toLowerCase().replace(/\s+/g,'-')}?experience=0&jobAge=7`;
-    console.log(`Naukri: loading "${role}" in "${location}"`);
+    // Naukri has a public search API used by their own site
+    const query = encodeURIComponent(role);
+    const loc = encodeURIComponent(location);
+    const apiUrl = `https://www.naukri.com/jobapi/v3/search?noOfResults=${maxJobs * 2}&urlType=search_by_keyword&searchType=adv&keyword=${query}&location=${loc}&experience=0&jobAge=7&src=jobsearchDesk&pageNo=1`;
 
+    console.log(`Naukri API: fetching "${role}" in "${location}"`);
+
+    await page.setExtraHTTPHeaders({
+      'Accept': 'application/json',
+      'appid': '109',
+      'systemid': 'Naukri',
+      'Referer': 'https://www.naukri.com/',
+    });
+
+    const response = await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    const text = await page.evaluate(() => document.body.innerText);
+
+    let data;
+    try { data = JSON.parse(text); } catch (_) {
+      console.log('Naukri API JSON parse failed, trying HTML scrape fallback');
+      return await scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords);
+    }
+
+    const jobList = data?.jobDetails || data?.jobs || [];
+    console.log(`Naukri API: got ${jobList.length} jobs`);
+
+    for (const job of jobList) {
+      if (jobs.length >= maxJobs) break;
+      const title = job.title || job.jobTitle || '';
+      if (!title || shouldExclude(title, excludeKeywords)) continue;
+
+      const salary = job.salary || job.salaryDetail || '';
+      const skills = Array.isArray(job.tagsAndSkills) ? job.tagsAndSkills.join(', ') : (job.skills || '');
+      const desc = job.jobDescription || job.snippets?.jobExperience || '';
+
+      jobs.push({
+        title,
+        company: job.companyName || job.company || 'Unknown',
+        location: (Array.isArray(job.placeholders) ? job.placeholders.find(p => p.type === 'location')?.label : null) || location,
+        url: job.jdURL ? `https://www.naukri.com${job.jdURL}` : (job.jobUrl || `https://www.naukri.com/jobs`),
+        salary: cleanSalary(salary),
+        experience: job.experienceText || '0-2 Years',
+        description: desc ? `${desc}\n\nSkills: ${skills}`.substring(0, 1500) : (skills ? `Skills: ${skills}` : `${title} at ${job.companyName}`),
+        postedDate: job.createdDate || new Date().toISOString(),
+        source: 'Naukri',
+        experienceLevel: 'Entry level'
+      });
+    }
+
+    if (jobs.length === 0) {
+      console.log('Naukri API returned 0 jobs, trying HTML fallback');
+      return await scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords);
+    }
+
+  } catch (err) {
+    console.error(`Naukri API error: ${err.message}`);
+    try { return await scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords); } catch (_) {}
+  }
+  return jobs;
+}
+
+async function scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords) {
+  const jobs = [];
+  try {
+    const roleSlug = role.toLowerCase().replace(/\s+/g, '-');
+    const locSlug = location.toLowerCase().replace(/\s+/g, '-');
+    const url = `https://www.naukri.com/${roleSlug}-jobs-in-${locSlug}?experience=0&jobAge=7`;
+    console.log(`Naukri HTML: loading ${url}`);
+
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-IN,en;q=0.9' });
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(3000);
 
-    // Scroll to trigger lazy loading
-    for (let i = 0; i < 4; i++) {
-      await page.evaluate(() => window.scrollBy(0, 700));
-      await sleep(600);
-    }
+    for (let i = 0; i < 4; i++) { await page.evaluate(() => window.scrollBy(0, 700)); await sleep(600); }
 
-    await page.waitForSelector('[class*="jobTuple"], article.jobTuple, .cust-job-tuple', { timeout: 10000 }).catch(() => {});
-
+    // Try multiple selectors for Naukri's changing layout
     let cards = [];
     for (const sel of [
-      'article.jobTuple', '[class*="jobTuple"]', '.cust-job-tuple',
-      '[class*="job-tuple"]', '[class*="srp-jobtuple"]', '.list article'
+      '[class*="srp-jobtuple-wrapper"]', '[class*="jobTuple"]',
+      'article.jobTuple', '.cust-job-tuple', '[class*="job-tuple"]',
+      '[class*="list"] article', '.list article'
     ]) {
       cards = await page.$$(sel);
-      if (cards.length > 0) { console.log(`Naukri: using "${sel}", found ${cards.length} cards`); break; }
+      if (cards.length > 0) { console.log(`Naukri HTML: using "${sel}", ${cards.length} cards`); break; }
     }
-
-    console.log(`Naukri: total cards found = ${cards.length}`);
 
     for (const card of cards) {
       if (jobs.length >= maxJobs) break;
       try {
         const title = await card.$eval(
-          'a.title, [class*="title"] a, h2 a, .jobTitle a, a[class*="title"]',
+          'a.title, [class*="title"] a, h2 a, .jobTitle a, a[class*="title"], [class*="row1"] a',
           el => el.innerText.trim()
         ).catch(() => null);
-
-        if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
+        if (!title || shouldExclude(title, excludeKeywords)) continue;
 
         const company = await card.$eval(
-          'a.subTitle, [class*="subTitle"], [class*="companyInfo"] a, .comp-name, [class*="comp-name"]',
+          'a.subTitle, [class*="companyInfo"] a, .comp-name, [class*="comp-name"], [class*="company-name"]',
           el => el.innerText.trim()
         ).catch(() => 'Unknown');
 
-        // Naukri shows real salary in cards - grab it
         const salary = await card.$eval(
-          '[class*="salary"], .salary, [class*="sal"], li.salary',
-          el => el.innerText.trim()
-        ).catch(() => null);
-
-        // Naukri shows real experience requirement
-        const experience = await card.$eval(
-          '[class*="experience"], .experience, li.experience, [class*="exp"]',
+          '[class*="salary"], li.salary, [class*="sal"]',
           el => el.innerText.trim()
         ).catch(() => null);
 
         const locationText = await card.$eval(
-          '[class*="location"], .location, li.location, [class*="loc"]',
+          '[class*="location"], li.location, [class*="loc"]',
           el => el.innerText.trim()
         ).catch(() => location);
 
-        // Real job description snippet
-        const description = await card.$eval(
-          '[class*="job-description"], [class*="jobDesc"], .job-desc, [class*="description"]',
-          el => el.innerText.trim()
-        ).catch(() => null);
-
-        // Skills listed on card
         const skills = await card.$eval(
-          '[class*="tags"], [class*="skills"], ul.tags-gt li',
+          '[class*="tags"], ul.tags-gt, [class*="skill"]',
           el => el.innerText.replace(/\n/g, ', ').trim()
-        ).catch(() => null);
-
-        const jobUrl = await card.$eval(
-          'a.title, a[class*="title"], h2 a',
-          el => el.href
-        ).catch(() => null);
-
-        if (!jobUrl) continue;
-
-        const postedDate = await card.$eval(
-          '[class*="postedDate"], .postedDate, time',
-          el => el.innerText.trim()
         ).catch(() => '');
 
+        const jobUrl = await card.$eval(
+          'a.title, a[class*="title"], h2 a, [class*="row1"] a',
+          el => el.href
+        ).catch(() => null);
+        if (!jobUrl) continue;
+
         jobs.push({
-          title,
-          company,
+          title, company,
           location: locationText.replace(/\n/g, ', ').trim(),
           url: jobUrl.startsWith('http') ? jobUrl : `https://www.naukri.com${jobUrl}`,
           salary: cleanSalary(salary),
-          experience: experience || '0-2 Years',
-          description: description
-            ? (skills ? `${description}\n\nSkills: ${skills}` : description).substring(0, 1500)
-            : (skills ? `Skills required: ${skills}` : `${title} at ${company}`),
-          postedDate,
+          experience: '0-2 Years',
+          description: skills ? `Skills required: ${skills}` : `${title} at ${company}`,
+          postedDate: new Date().toISOString(),
           source: 'Naukri',
           experienceLevel: 'Entry level'
         });
       } catch (_) {}
     }
+    console.log(`Naukri HTML: returning ${jobs.length} jobs`);
+  } catch (err) {
+    console.error(`Naukri HTML error: ${err.message}`);
+  }
+  return jobs;
+}
 
-    // Fallback: try link-based approach
+// ─── INTERNSHALA (replaces Foundit which 403s) ────────────────────────────────
+// Internshala is extremely scraping-friendly and has real entry-level jobs
+
+async function scrapeInternshala(page, role, location, maxJobs, excludeKeywords) {
+  const jobs = [];
+  try {
+    const query = role.toLowerCase().replace(/\s+/g, '-');
+    const url = `https://internshala.com/jobs/${query}-jobs-in-${location.toLowerCase().replace(/\s+/g, '-')}`;
+    console.log(`Internshala: loading "${role}" in "${location}"`);
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await sleep(2500);
+    for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, 600)); await sleep(500); }
+
+    await page.waitForSelector('.internship_meta, .individual_internship, [class*="internship-list"]', { timeout: 10000 }).catch(() => {});
+
+    let cards = [];
+    for (const sel of [
+      '.individual_internship', '[class*="individual_internship"]',
+      '.internship_meta', '[data-internship_id]', '.container-fluid .internship'
+    ]) {
+      cards = await page.$$(sel);
+      if (cards.length > 0) { console.log(`Internshala: using "${sel}", ${cards.length} cards`); break; }
+    }
+
+    for (const card of cards) {
+      if (jobs.length >= maxJobs) break;
+      try {
+        const title = await card.$eval(
+          '.profile a, h3.job-internship-name a, .job-title a, [class*="profile"] a, h3 a',
+          el => el.innerText.trim()
+        ).catch(() => null);
+        if (!title || shouldExclude(title, excludeKeywords)) continue;
+
+        const company = await card.$eval(
+          '.company-name a, .company_name a, [class*="company-name"], h4.company-name',
+          el => el.innerText.trim()
+        ).catch(() => 'Unknown');
+
+        const locationText = await card.$eval(
+          '.locations a, .location_link a, [class*="location"] a, .location span',
+          el => el.innerText.trim()
+        ).catch(() => location);
+
+        const salary = await card.$eval(
+          '.stipend, [class*="stipend"], .salary',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        const skills = await card.$eval(
+          '.skill-container span, [class*="skill"] span',
+          el => el.innerText.trim()
+        ).catch(() => '');
+
+        const jobUrl = await card.$eval(
+          'a.view_detail_button, a[href*="/jobs/detail"], h3 a, .profile a',
+          el => el.href
+        ).catch(() => null);
+        if (!jobUrl) continue;
+
+        const postedDate = await card.$eval(
+          '.posted_by_container span, [class*="posted"], .status-success',
+          el => el.innerText.trim()
+        ).catch(() => '');
+
+        jobs.push({
+          title, company,
+          location: locationText,
+          url: jobUrl.startsWith('http') ? jobUrl : `https://internshala.com${jobUrl}`,
+          salary: cleanSalary(salary),
+          experience: 'Fresher / 0-2 Years',
+          description: skills ? `Skills: ${skills}` : `${title} at ${company}`,
+          postedDate,
+          source: 'Internshala',
+          experienceLevel: 'Entry level'
+        });
+      } catch (_) {}
+    }
+
+    // Fallback: grab job links directly
     if (jobs.length === 0) {
-      console.log('Naukri: primary selector failed, trying link fallback');
-      const links = await page.$$('a[href*="naukri.com"][href*="-jobs-"]');
-      console.log(`Naukri: found ${links.length} job links in fallback`);
+      console.log('Internshala: trying link fallback');
+      const links = await page.$$('a[href*="/jobs/detail/"], a[href*="internshala.com/jobs/"]');
       for (const link of links.slice(0, maxJobs * 2)) {
         if (jobs.length >= maxJobs) break;
         try {
-          const text = (await link.innerText() || '').trim();
+          const text = (await link.innerText().catch(() => '')).trim();
           if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const href = await link.getAttribute('href');
           if (!href || href === '#') continue;
           jobs.push({
-            title: text,
-            company: 'See job link',
-            location,
-            url: href.startsWith('http') ? href : `https://www.naukri.com${href}`,
-            salary: 'Not disclosed',
-            experience: '0-2 Years',
-            description: `${text} - Apply on Naukri.com`,
-            postedDate: '',
-            source: 'Naukri',
-            experienceLevel: 'Entry level'
+            title: text, company: 'See job link', location,
+            url: href.startsWith('http') ? href : `https://internshala.com${href}`,
+            salary: 'Not disclosed', experience: 'Fresher',
+            description: `${text} — Apply on Internshala`,
+            postedDate: '', source: 'Internshala', experienceLevel: 'Entry level'
           });
         } catch (_) {}
       }
     }
 
-    console.log(`Naukri: returning ${jobs.length} jobs`);
+    console.log(`Internshala: returning ${jobs.length} jobs`);
   } catch (err) {
-    console.error(`Naukri error: ${err.message}`);
+    console.error(`Internshala error: ${err.message}`);
   }
   return jobs;
 }
 
-// ─── FOUNDIT (formerly Monster India) ────────────────────────────────────────
-// Restored with better selectors that actually work on current Foundit layout
+// ─── FOUNDIT (with Internshala fallback) ──────────────────────────────────────
 
 async function scrapeFoundit(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
@@ -394,34 +392,40 @@ async function scrapeFoundit(page, role, location, maxJobs, excludeKeywords) {
     const url = `https://www.foundit.in/srp/results?query=${query}&location=${loc}&experienceRanges=0~3&jobAge=7`;
     console.log(`Foundit: loading "${role}" in "${location}"`);
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(3000);
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const status = response ? response.status() : 0;
+    console.log(`Foundit: HTTP status ${status}`);
 
-    for (let i = 0; i < 3; i++) {
-      await page.evaluate(() => window.scrollBy(0, 600));
-      await sleep(700);
+    if (status === 403 || status === 429) {
+      console.log('Foundit blocked — switching to Internshala fallback');
+      return await scrapeInternshala(page, role, location, maxJobs, excludeKeywords);
     }
 
-    await page.waitForSelector('[class*="card"], [class*="job-card"], [class*="srp-"]', { timeout: 10000 }).catch(() => {});
+    await sleep(3000);
+    for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, 600)); await sleep(700); }
 
     let cards = [];
     for (const sel of [
       '[class*="cardContainer"]', '[class*="jobCard"]', '[class*="card-container"]',
-      '.srp-jobtuple', '[class*="resultItem"]', '[data-job-id]',
-      'article[class*="job"]', '[class*="jobItem"]'
+      '[data-job-id]', 'article[class*="job"]', '[class*="jobItem"]',
+      '[class*="srp-jobtuple"]', '[class*="resultItem"]'
     ]) {
       cards = await page.$$(sel);
-      if (cards.length > 0) { console.log(`Foundit: using "${sel}", found ${cards.length} cards`); break; }
+      if (cards.length > 0) { console.log(`Foundit: using "${sel}", ${cards.length} cards`); break; }
+    }
+
+    if (cards.length === 0) {
+      console.log('Foundit: no cards found — switching to Internshala');
+      return await scrapeInternshala(page, role, location, maxJobs, excludeKeywords);
     }
 
     for (const card of cards) {
       if (jobs.length >= maxJobs) break;
       try {
         const title = await card.$eval(
-          '[class*="title"], [class*="jobTitle"], h3, h2, a[class*="job"]',
+          '[class*="title"], h3, h2, a[class*="job"]',
           el => el.innerText.trim()
         ).catch(() => null);
-
         if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
 
         const company = await card.$eval(
@@ -430,12 +434,7 @@ async function scrapeFoundit(page, role, location, maxJobs, excludeKeywords) {
         ).catch(() => 'Unknown');
 
         const salary = await card.$eval(
-          '[class*="salary"], [class*="sal"], [class*="ctc"], [class*="package"]',
-          el => el.innerText.trim()
-        ).catch(() => null);
-
-        const experience = await card.$eval(
-          '[class*="experience"], [class*="exp"], [class*="year"]',
+          '[class*="salary"], [class*="sal"], [class*="ctc"]',
           el => el.innerText.trim()
         ).catch(() => null);
 
@@ -444,67 +443,32 @@ async function scrapeFoundit(page, role, location, maxJobs, excludeKeywords) {
           el => el.innerText.trim()
         ).catch(() => location);
 
-        const description = await card.$eval(
-          '[class*="description"], [class*="desc"], [class*="snippet"]',
-          el => el.innerText.trim()
-        ).catch(() => null);
-
         const jobUrl = await card.$eval(
           'a[href*="foundit"], a[href*="/job/"], a',
           el => el.href
         ).catch(() => null);
-
         if (!jobUrl) continue;
 
-        const postedDate = await card.$eval(
-          '[class*="date"], [class*="posted"], time',
-          el => el.innerText.trim()
-        ).catch(() => '');
-
         jobs.push({
-          title,
-          company,
-          location: locationText,
+          title, company, location: locationText,
           url: jobUrl.startsWith('http') ? jobUrl : `https://www.foundit.in${jobUrl}`,
-          salary: cleanSalary(salary),
-          experience: experience || '0-2 Years',
-          description: description ? description.substring(0, 1500) : `${title} at ${company} in ${locationText}`,
-          postedDate,
-          source: 'Foundit',
-          experienceLevel: 'Entry level'
+          salary: cleanSalary(salary), experience: '0-2 Years',
+          description: `${title} at ${company} in ${locationText}`,
+          postedDate: new Date().toISOString(),
+          source: 'Foundit', experienceLevel: 'Entry level'
         });
       } catch (_) {}
     }
 
-    // Link fallback
     if (jobs.length === 0) {
-      const links = await page.$$('a[href*="/job/"], a[href*="foundit.in"]');
-      for (const link of links.slice(0, maxJobs * 2)) {
-        if (jobs.length >= maxJobs) break;
-        try {
-          const text = (await link.innerText() || '').trim();
-          if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
-          const href = await link.getAttribute('href');
-          if (!href || href === '#') continue;
-          const jobUrl = href.startsWith('http') ? href : `https://www.foundit.in${href}`;
-          const companyName = await link.evaluate(el => {
-            const card = el.closest('[class*="card" i], article');
-            const c = card?.querySelector('[class*="company" i], [class*="employer" i]');
-            return c ? c.innerText.trim() : null;
-          }).catch(() => null);
-          jobs.push({
-            title: text, company: companyName || 'See job link', location,
-            url: jobUrl, salary: 'Not disclosed', experience: '0-2 Years',
-            description: `${text} - Apply on Foundit`, postedDate: '',
-            source: 'Foundit', experienceLevel: 'Entry level'
-          });
-        } catch (_) {}
-      }
+      console.log('Foundit: 0 jobs extracted — switching to Internshala');
+      return await scrapeInternshala(page, role, location, maxJobs, excludeKeywords);
     }
 
     console.log(`Foundit: returning ${jobs.length} jobs`);
   } catch (err) {
-    console.error(`Foundit error: ${err.message}`);
+    console.error(`Foundit error: ${err.message} — trying Internshala`);
+    try { return await scrapeInternshala(page, role, location, maxJobs, excludeKeywords); } catch (_) {}
   }
   return jobs;
 }
@@ -512,34 +476,29 @@ async function scrapeFoundit(page, role, location, maxJobs, excludeKeywords) {
 // ─── COMPANY CAREER PAGES ─────────────────────────────────────────────────────
 
 const COMPANY_CAREERS = [
-  { name: 'Infosys',    url: 'https://career.infosys.com/joblist',      origin: 'https://career.infosys.com' },
-  { name: 'Wipro',      url: 'https://careers.wipro.com/careers-home/', origin: 'https://careers.wipro.com' },
-  { name: 'Cognizant',  url: 'https://careers.cognizant.com/global/en', origin: 'https://careers.cognizant.com' },
-  { name: 'TCS',        url: 'https://www.tcs.com/careers/tcs-careers-jobdetails', origin: 'https://www.tcs.com' },
-  { name: 'HCL',        url: 'https://www.hcltech.com/careers',         origin: 'https://www.hcltech.com' },
+  { name: 'Infosys', url: 'https://career.infosys.com/joblist', origin: 'https://career.infosys.com' },
+  { name: 'Wipro', url: 'https://careers.wipro.com/careers-home/', origin: 'https://careers.wipro.com' },
+  { name: 'TCS', url: 'https://www.tcs.com/careers/tcs-careers-jobdetails', origin: 'https://www.tcs.com' },
+  { name: 'HCL', url: 'https://www.hcltech.com/careers', origin: 'https://www.hcltech.com' },
+  { name: 'Cognizant', url: 'https://careers.cognizant.com/global/en', origin: 'https://careers.cognizant.com' },
 ];
 
-const NON_JOB_PATH_PATTERNS = [
-  'login', 'logout', 'signin', 'sign-in', 'signup', 'sign-up', 'register',
-  'account', 'profile', 'about', 'contact', 'faq', 'privacy', 'terms',
-  'help', 'support', 'cookie', 'feedback', 'unsubscribe', 'home', 'index'
-];
+const NON_JOB_PATHS = ['login','logout','signin','signup','register','account','profile',
+  'about','contact','faq','privacy','terms','help','support','cookie','home','index'];
 
 function isNonJobPath(href) {
   const h = href.toLowerCase();
-  return NON_JOB_PATH_PATTERNS.some(p => h.includes(p));
+  return NON_JOB_PATHS.some(p => h.includes(p));
 }
 
 function looksLikeJobTitle(text) {
   const t = text.trim();
   if (t.length < 8 || t.split(/\s+/).length < 2) return false;
-  const roleWords = ['engineer', 'developer', 'software', 'analyst', 'architect',
-    'consultant', 'specialist', 'associate', 'designer', 'administrator',
-    'scientist', 'tester', 'qa', 'devops', 'intern', 'trainee', 'fresher',
-    'graduate', 'technology', 'technical', 'programmer', 'full stack', 'backend',
-    'frontend', 'data', 'cloud', 'support', 'network'];
-  const tl = t.toLowerCase();
-  return roleWords.some(w => tl.includes(w));
+  const roleWords = ['engineer','developer','software','analyst','architect','consultant',
+    'specialist','associate','designer','administrator','scientist','tester','qa',
+    'devops','intern','trainee','fresher','graduate','technology','technical',
+    'programmer','full stack','backend','frontend','data','cloud','support'];
+  return roleWords.some(w => t.toLowerCase().includes(w));
 }
 
 async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords) {
@@ -550,11 +509,8 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
       await page.goto(company.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
       await sleep(2000);
 
-      // Try to search for the role
       try {
-        const searchBox = await page.$(
-          'input[type="search"], input[placeholder*="search" i], input[name*="keyword" i], input[placeholder*="job" i], input[placeholder*="role" i]'
-        );
+        const searchBox = await page.$('input[type="search"], input[placeholder*="search" i], input[name*="keyword" i], input[placeholder*="job" i]');
         if (searchBox) {
           await searchBox.fill(role);
           await page.keyboard.press('Enter');
@@ -566,81 +522,61 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
       for (const link of links.slice(0, 200)) {
         if (companyJobs.length >= maxJobs) break;
         try {
-          const text = (await link.innerText() || '').trim();
+          const text = (await link.innerText().catch(() => '')).trim();
           const rawHref = await link.getAttribute('href');
           if (!rawHref || isNonJobPath(rawHref)) continue;
           if (!looksLikeJobTitle(text) || shouldExclude(text, excludeKeywords)) continue;
-
-          const jobUrl = rawHref.startsWith('http')
-            ? rawHref
-            : `${company.origin}${rawHref.startsWith('/') ? '' : '/'}${rawHref}`;
-
+          const jobUrl = rawHref.startsWith('http') ? rawHref : `${company.origin}${rawHref.startsWith('/') ? '' : '/'}${rawHref}`;
           companyJobs.push({
-            title: text,
-            company: company.name,
-            location,
-            url: jobUrl,
-            salary: 'As per industry standards',
-            experience: '0-2 Years (Fresher/Entry level)',
-            description: `${text} at ${company.name}. Entry level opportunity.`,
+            title: text, company: company.name, location,
+            url: jobUrl, salary: 'As per industry standards',
+            experience: '0-2 Years',
+            description: `${text} at ${company.name}. Apply directly on their careers page.`,
             postedDate: new Date().toISOString().split('T')[0],
-            source: `${company.name} Careers`,
-            experienceLevel: 'Entry level'
+            source: `${company.name} Careers`, experienceLevel: 'Entry level'
           });
         } catch (_) {}
       }
       console.log(`Company: ${company.name} → ${companyJobs.length} jobs`);
     } catch (err) {
-      console.error(`Company error [${company.name}]: ${err.message}`);
+      console.error(`Company [${company.name}]: ${err.message}`);
     }
     jobs.push(...companyJobs);
   }
   return jobs;
 }
 
-// ─── ATS SCORING ENDPOINT ─────────────────────────────────────────────────────
-
-app.post('/ats-score', (req, res) => {
-  const { resumeSkills, resumeExperience, jobs } = req.body;
-  if (!jobs || !Array.isArray(jobs)) {
-    return res.status(400).json({ error: 'jobs array required' });
-  }
-  const scored = jobs.map(job => ({
-    ...job,
-    atsScore: calculateATS(resumeSkills, resumeExperience, job.title, job.description)
-  }));
-  // Sort by ATS score descending
-  scored.sort((a, b) => (b.atsScore || 0) - (a.atsScore || 0));
-  res.json(scored);
-});
-
-// ─── ROUTES ───────────────────────────────────────────────────────────────────
+// ─── HEALTH ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// ─── LINKEDIN ─────────────────────────────────────────────────────────────────
 
 app.post('/linkedin-jobs', async (req, res) => {
   const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
-    const context = await newLinkedInContext(browser);
-    const page = await context.newPage();
+    const storageState = getLinkedInStorageState();
+    const ctx = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+      ...(storageState ? { storageState } : {})
+    });
+    const page = await ctx.newPage();
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        console.log(`LinkedIn: scraping "${search.role}" in "${location}"`);
         const jobs = await scrapeLinkedIn(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []);
         allJobs.push(...jobs);
-        await sleep(1500);
+        await randomDelay(1500, 3000);
       }
     }
-
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`LinkedIn: total returning ${allJobs.length} jobs`);
+    console.log(`LinkedIn total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -648,7 +584,8 @@ app.post('/linkedin-jobs', async (req, res) => {
   }
 });
 
-// Naukri endpoint (replaces the old /indeed-jobs which scraped Shine)
+// ─── NAUKRI (/indeed-jobs endpoint kept same so n8n workflow doesn't break) ───
+
 app.post('/indeed-jobs', async (req, res) => {
   const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
   let allJobs = [], browser;
@@ -656,23 +593,19 @@ app.post('/indeed-jobs', async (req, res) => {
     browser = await launchBrowser();
     const page = await (await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      extraHTTPHeaders: {
-        'Accept-Language': 'en-IN,en;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      }
+      extraHTTPHeaders: { 'Accept-Language': 'en-IN,en;q=0.9' }
     })).newPage();
 
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        console.log(`Naukri: scraping "${search.role}" in "${location}"`);
-        allJobs.push(...await scrapeNaukri(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
-        await sleep(2000);
+        const jobs = await scrapeNaukri(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []);
+        allJobs.push(...jobs);
+        await randomDelay(2000, 4000);
       }
     }
-
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Naukri: total returning ${allJobs.length} jobs`);
+    console.log(`Naukri total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -680,7 +613,8 @@ app.post('/indeed-jobs', async (req, res) => {
   }
 });
 
-// Foundit endpoint (replaces old /google-jobs)
+// ─── FOUNDIT + INTERNSHALA fallback (/google-jobs endpoint kept same) ─────────
+
 app.post('/google-jobs', async (req, res) => {
   const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
   let allJobs = [], browser;
@@ -688,29 +622,27 @@ app.post('/google-jobs', async (req, res) => {
     browser = await launchBrowser();
     const page = await (await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      extraHTTPHeaders: {
-        'Accept-Language': 'en-IN,en;q=0.9',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      }
+      extraHTTPHeaders: { 'Accept-Language': 'en-IN,en;q=0.9' }
     })).newPage();
 
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        console.log(`Foundit: scraping "${search.role}" in "${location}"`);
-        allJobs.push(...await scrapeFoundit(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
-        await sleep(2000);
+        const jobs = await scrapeFoundit(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []);
+        allJobs.push(...jobs);
+        await randomDelay(2000, 4000);
       }
     }
-
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Foundit: total returning ${allJobs.length} jobs`);
+    console.log(`Foundit/Internshala total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
     res.status(500).json({ error: err.message });
   }
 });
+
+// ─── COMPANY CAREERS ──────────────────────────────────────────────────────────
 
 app.post('/company-jobs', async (req, res) => {
   const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
@@ -723,14 +655,12 @@ app.post('/company-jobs', async (req, res) => {
 
     for (const search of searches) {
       const location = (search.locations || ['Bangalore'])[0];
-      console.log(`Company: scraping "${search.role}" in "${location}"`);
       allJobs.push(...await scrapeCompanyJobs(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
       await sleep(1000);
     }
-
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Company: total returning ${allJobs.length} jobs`);
+    console.log(`Company total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -739,6 +669,6 @@ app.post('/company-jobs', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Job scraper server running on port ${PORT}`);
-  console.log('Endpoints: GET /health | POST /linkedin-jobs | POST /indeed-jobs | POST /google-jobs | POST /company-jobs | POST /ats-score');
+  console.log(`Server running on port ${PORT}`);
+  console.log('Endpoints: /health | /linkedin-jobs | /indeed-jobs | /google-jobs | /company-jobs');
 });
