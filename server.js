@@ -1,334 +1,522 @@
 const express = require('express');
 const { chromium } = require('playwright');
-const PDFDocument = require('pdfkit');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 const app = express();
 app.use(express.json({ limit: '5mb' }));
 
 const PORT = process.env.PORT || 3000;
 
-// Generates a simple, plain PDF resume from the candidate's resume text and
-// saves it to a temp file. Used to give applyGeneric something real to
-// upload when a job form has a file input for the resume. This is NOT a
-// substitute for the user's original formatted PDF - it's a plain text
-// rendering, used only so automated forms that require a file don't fail
-// outright. Returns the absolute file path, or null on failure.
-async function generateResumePdf(candidate) {
-  const text = (candidate.resumeText || '').trim();
-  if (!text) {
-    console.log('Resume PDF: no resumeText available, skipping generation');
-    return null;
-  }
-  try {
-    const tmpPath = path.join(os.tmpdir(), `resume-${Date.now()}.pdf`);
-    const doc = new PDFDocument({ margin: 50 });
-    const writeStream = fs.createWriteStream(tmpPath);
-    doc.pipe(writeStream);
-
-    doc.fontSize(16).text(candidate.fullName || 'Resume', { underline: true });
-    doc.moveDown(0.5);
-    if (candidate.email) doc.fontSize(10).text(`Email: ${candidate.email}`);
-    if (candidate.phone) doc.fontSize(10).text(`Phone: ${candidate.phone}`);
-    doc.moveDown(1);
-    doc.fontSize(11).text(text, { align: 'left' });
-
-    doc.end();
-
-    await new Promise((resolve, reject) => {
-      writeStream.on('finish', resolve);
-      writeStream.on('error', reject);
-    });
-
-    console.log(`Resume PDF: generated at ${tmpPath}`);
-    return tmpPath;
-  } catch (err) {
-    console.error('Resume PDF: generation failed:', err.message);
-    return null;
-  }
-}
-
-// Deletes a generated resume PDF after it's been used, so temp files don't
-// pile up across runs.
-function cleanupResumePdf(filePath) {
-  if (!filePath) return;
-  fs.unlink(filePath, (err) => {
-    if (err) console.error('Resume PDF: cleanup failed:', err.message);
-  });
-}
+// ─── UTILITIES ────────────────────────────────────────────────────────────────
 
 async function launchBrowser() {
   return await chromium.launch({
     headless: true,
-    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-           '--disable-accelerated-2d-canvas','--no-first-run','--no-zygote',
-           '--single-process','--disable-gpu']
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
+      '--single-process', '--disable-gpu'
+    ]
   });
-}
-
-function shouldExclude(title, excludeKeywords = []) {
-  const t = title.toLowerCase();
-  return excludeKeywords.some(kw => t.includes(kw.toLowerCase()));
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Randomized delay used for LinkedIn interactions specifically, to avoid the
-// perfectly even timing that's a strong signal of automation. Defaults to a
-// 1.5-3s pause; callers can pass a tighter or wider range for specific steps.
-function humanPause(minMs = 1500, maxMs = 3000) {
-  const ms = minMs + Math.floor(Math.random() * (maxMs - minMs));
-  return sleep(ms);
+function shouldExclude(title, excludeKeywords = []) {
+  const t = (title || '').toLowerCase();
+  return excludeKeywords.some(kw => t.includes(kw.toLowerCase()));
 }
 
-// Loads the saved LinkedIn session (cookies + localStorage) from the
-// LINKEDIN_SESSION_STATE environment variable, if it's set. Returns null
-// if missing or invalid, so callers can fall back to a logged-out context
-// instead of crashing.
+function deduplicateJobs(jobs) {
+  const seen = new Set();
+  return jobs.filter(j => {
+    const key = (j.url || '') + '|' + (j.title || '') + '|' + (j.company || '');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// Cleans up salary text - removes extra whitespace and normalises
+function cleanSalary(text) {
+  if (!text) return 'Not disclosed';
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  // Filter out non-salary strings that sometimes bleed in
+  if (cleaned.length < 3 || cleaned.length > 80) return 'Not disclosed';
+  if (/salary|lpa|lakh|per annum|₹|inr|ctc|pa|month|year/i.test(cleaned)) return cleaned;
+  return 'Not disclosed';
+}
+
+// Simple ATS scorer - compares resume skills against job description
+// Returns 0-100 score based on keyword overlap
+function calculateATS(resumeSkills, resumeExperience, jobTitle, jobDescription) {
+  if (!resumeSkills && !resumeExperience) return null; // no resume data
+
+  const resumeText = ((resumeSkills || '') + ' ' + (resumeExperience || '')).toLowerCase();
+  const jobText = ((jobTitle || '') + ' ' + (jobDescription || '')).toLowerCase();
+
+  // Extract meaningful words from job description (ignore stopwords)
+  const stopwords = new Set(['the','a','an','and','or','but','in','on','at','to','for',
+    'of','with','by','from','as','is','are','was','were','be','been','being',
+    'have','has','had','do','does','did','will','would','could','should','may',
+    'might','shall','can','need','must','our','your','their','we','you','they',
+    'it','this','that','these','those','who','which','what','where','when','how',
+    'all','any','both','each','few','more','most','other','some','such','than',
+    'too','very','just','about','above','after','before','between','into','through',
+    'during','including','work','working','experience','good','strong','excellent',
+    'ability','skills','knowledge','understanding','team','company','looking','role',
+    'position','join','opportunity','candidate','required','requirements','responsibilities',
+    'apply','job','hiring','recruit','description','qualification','preferred','plus','years']);
+
+  const jobWords = jobText.split(/\W+/).filter(w => w.length > 2 && !stopwords.has(w));
+  const uniqueJobWords = [...new Set(jobWords)];
+
+  // Tech/role specific terms get double weight
+  const techTerms = ['python','java','javascript','typescript','react','node','nodejs',
+    'angular','vue','sql','mysql','postgresql','mongodb','redis','aws','azure','gcp',
+    'docker','kubernetes','git','linux','api','rest','graphql','microservices','agile',
+    'scrum','spring','django','flask','express','html','css','devops','ci/cd','jenkins',
+    'terraform','ansible','kafka','spark','hadoop','machine learning','deep learning',
+    'tensorflow','pytorch','nlp','data science','data engineering','etl','tableau',
+    'powerbi','excel','c++','c#','.net','php','ruby','golang','rust','swift','kotlin',
+    'android','ios','flutter','react native','selenium','cypress','junit','jest'];
+
+  let matched = 0;
+  let total = 0;
+
+  for (const word of uniqueJobWords) {
+    if (techTerms.includes(word)) {
+      total += 2;
+      if (resumeText.includes(word)) matched += 2;
+    } else {
+      total += 1;
+      if (resumeText.includes(word)) matched += 1;
+    }
+  }
+
+  if (total === 0) return 60; // default mid-score if no extractable keywords
+  const raw = Math.round((matched / total) * 100);
+  // Clamp between 20-95 (no perfect scores, no zero scores for real jobs)
+  return Math.min(95, Math.max(20, raw));
+}
+
+// ─── LINKEDIN ─────────────────────────────────────────────────────────────────
+
 function getLinkedInStorageState() {
   const raw = process.env.LINKEDIN_SESSION_STATE;
-  if (!raw) {
-    console.log('LinkedIn: no LINKEDIN_SESSION_STATE set, using logged-out session');
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    console.log('LinkedIn: loaded saved session from LINKEDIN_SESSION_STATE');
-    return parsed;
-  } catch (err) {
-    console.error('LinkedIn: LINKEDIN_SESSION_STATE is not valid JSON, ignoring it:', err.message);
-    return null;
-  }
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
 }
 
-// Creates a browser context for LinkedIn, using the saved session if
-// available so requests appear logged-in instead of as a guest.
 async function newLinkedInContext(browser) {
   const storageState = getLinkedInStorageState();
-  const contextOptions = { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' };
-  if (storageState) contextOptions.storageState = storageState;
-  return await browser.newContext(contextOptions);
+  const opts = {
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36'
+  };
+  if (storageState) opts.storageState = storageState;
+  return await browser.newContext(opts);
 }
 
-// LinkedIn (unchanged - working)
+// Scrapes the actual job detail page to get real description
+async function fetchLinkedInJobDetail(page, url) {
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await sleep(1500);
+
+    const description = await page.$eval(
+      '.show-more-less-html__markup, .description__text, [class*="description"] .show-more-less-html',
+      el => el.innerText.trim()
+    ).catch(() => null);
+
+    const salary = await page.$eval(
+      '.compensation__salary, [class*="salary"], .salary-range, .compensation-range',
+      el => el.innerText.trim()
+    ).catch(() => null);
+
+    const experienceLevel = await page.$eval(
+      '.description__job-criteria-text',
+      el => el.innerText.trim()
+    ).catch(() => null);
+
+    return {
+      description: description || null,
+      salary: cleanSalary(salary),
+      experienceLevel: experienceLevel || 'Entry level'
+    };
+  } catch (err) {
+    console.error(`LinkedIn detail fetch error: ${err.message}`);
+    return { description: null, salary: 'Not disclosed', experienceLevel: 'Entry level' };
+  }
+}
+
 async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(role)}&location=${encodeURIComponent(location)}&f_TPR=r86400&f_E=2%2C3&sortBy=DD`;
+    // f_E=2%2C3 = Entry level + Associate; f_TPR=r86400 = last 24h; sortBy=DD = most recent
+    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(role)}&location=${encodeURIComponent(location)}&f_TPR=r604800&f_E=2%2C3&sortBy=DD`;
+    console.log(`LinkedIn: loading ${url}`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(1500);
+    await sleep(2000);
+
+    // Accept cookies if prompted
     try { await page.click('button[action-type="ACCEPT"]', { timeout: 3000 }); await sleep(500); } catch (_) {}
-    await page.waitForSelector('.jobs-search__results-list, .job-card-container, .base-card', { timeout: 15000 }).catch(() => {});
+
+    // Scroll to load more cards
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => window.scrollBy(0, 600));
+      await sleep(800);
+    }
+
+    await page.waitForSelector('.job-card-container, .base-card', { timeout: 15000 }).catch(() => {});
+
     const cards = await page.$$('.job-card-container, .base-card');
     console.log(`LinkedIn: found ${cards.length} cards for "${role}" in "${location}"`);
-    for (const card of cards.slice(0, maxJobs)) {
-      try {
-        const title = await card.$eval('.job-card-list__title, .base-search-card__title', el => el.textContent.trim()).catch(() => null);
-        if (!title || shouldExclude(title, excludeKeywords)) continue;
-        const company = await card.$eval('.job-card-container__primary-description, .base-search-card__subtitle', el => el.textContent.trim()).catch(() => 'Unknown Company');
-        const locationText = await card.$eval('.job-card-container__metadata-item, .job-search-card__location', el => el.textContent.trim()).catch(() => location);
-        const jobUrl = await card.$eval('a.job-card-list__title, a.base-card__full-link', el => el.href).catch(() => null);
-        if (!jobUrl) continue;
-        jobs.push({ title, company, location: locationText, url: jobUrl, description: `${title} at ${company} in ${locationText}. Apply on LinkedIn.` });
-        if (jobs.length >= maxJobs) break;
-      } catch (_) {}
-    }
-  } catch (err) { console.error(`LinkedIn error:`, err.message); }
-  return jobs;
-}
-
-// Shine.com - working
-async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
-  const jobs = [];
-  try {
-    const roleSlug = role.toLowerCase().replace(/\s+/g, '-');
-    const locSlug = location.toLowerCase().replace(/\s+/g, '-');
-    const url = `https://www.shine.com/job-search/${roleSlug}-jobs-in-${locSlug}`;
-
-    console.log(`Shine: loading "${role}" in "${location}"`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(3000);
-
-    const pageTitle = await page.title();
-    console.log(`Shine: page title = "${pageTitle}"`);
-
-    await page.waitForSelector('.jdbigCard, [class*="jdbigCard"], [class*="bigCard"]', { timeout: 10000 }).catch(() => {});
-
-    let cards = [];
-    for (const sel of [
-      '.jdbigCard', '[class*="jdbigCard"]', '[class*="bigCard"]',
-      '[class*="jobCardNova"]', '[class*="jobCard"]'
-    ]) {
-      cards = await page.$$(sel);
-      if (cards.length > 0) { console.log(`Shine: using "${sel}", found ${cards.length} cards`); break; }
-    }
-
-    console.log(`Shine: total cards = ${cards.length}`);
 
     for (const card of cards) {
       if (jobs.length >= maxJobs) break;
       try {
         const title = await card.$eval(
-          '[class*="bigCardTopTitleHeading"], [class*="TitleHeading"], [class*="jdBigCardTopTitle"] h2, h2, h3',
-          el => el.textContent.trim()
+          '.job-card-list__title, .base-search-card__title, [class*="job-card-list__title"]',
+          el => el.innerText.trim()
         ).catch(() => null);
-        if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
+
+        if (!title || shouldExclude(title, excludeKeywords)) continue;
 
         const company = await card.$eval(
-          '[class*="bigCardTopCompany"], [class*="TopCompany"], [class*="company"]',
-          el => el.textContent.trim()
-        ).catch(() => 'Unknown');
+          '.job-card-container__primary-description, .base-search-card__subtitle, [class*="primary-description"]',
+          el => el.innerText.trim()
+        ).catch(() => 'Unknown Company');
+
+        const locationText = await card.$eval(
+          '.job-card-container__metadata-item, .job-search-card__location, [class*="metadata-item"]',
+          el => el.innerText.trim()
+        ).catch(() => location);
 
         const jobUrl = await card.$eval(
-          'a[href*="/job-detail/"], a[href*="shine.com/jobs"], a[href*="/jobs/"]',
+          'a.job-card-list__title, a.base-card__full-link, a[class*="base-card__full-link"]',
           el => el.href
         ).catch(() => null);
+
         if (!jobUrl) continue;
 
-        const fullUrl = jobUrl.startsWith('http') ? jobUrl : `https://www.shine.com${jobUrl}`;
-        jobs.push({ title, company, location, url: fullUrl, description: `${title} at ${company} in ${location}. Apply on Shine.` });
+        // Get salary from card if available
+        const salaryFromCard = await card.$eval(
+          '.job-card-container__salary-info, [class*="salary"]',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        const postedDate = await card.$eval(
+          'time, .job-card-container__listdate, [class*="listdate"]',
+          el => el.getAttribute('datetime') || el.innerText.trim()
+        ).catch(() => new Date().toISOString());
+
+        jobs.push({
+          title,
+          company,
+          location: locationText,
+          url: jobUrl,
+          salary: cleanSalary(salaryFromCard),
+          postedDate,
+          source: 'LinkedIn',
+          description: null, // fetched separately below
+          experienceLevel: 'Entry level'
+        });
       } catch (_) {}
     }
 
+    // Fetch real descriptions for each job (up to maxJobs)
+    console.log(`LinkedIn: fetching details for ${jobs.length} jobs...`);
+    for (const job of jobs) {
+      try {
+        const detail = await fetchLinkedInJobDetail(page, job.url);
+        if (detail.description) job.description = detail.description.substring(0, 1500);
+        if (detail.salary !== 'Not disclosed') job.salary = detail.salary;
+        job.experienceLevel = detail.experienceLevel;
+        await sleep(1000);
+      } catch (_) {}
+    }
+
+  } catch (err) {
+    console.error(`LinkedIn scrape error: ${err.message}`);
+  }
+  return jobs;
+}
+
+// ─── NAUKRI (replaces Shine/Indeed) ───────────────────────────────────────────
+// Naukri.com is India's largest job portal and DOES show real salary, 
+// experience, and company data in listing cards - far better than Shine.
+
+async function scrapeNaukri(page, role, location, maxJobs, excludeKeywords) {
+  const jobs = [];
+  try {
+    const roleSlug = encodeURIComponent(role);
+    const locSlug = encodeURIComponent(location);
+    // experienceRange=0 means fresher/entry level
+    const url = `https://www.naukri.com/${role.toLowerCase().replace(/\s+/g,'-')}-jobs-in-${location.toLowerCase().replace(/\s+/g,'-')}?experience=0&jobAge=7`;
+    console.log(`Naukri: loading "${role}" in "${location}"`);
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await sleep(3000);
+
+    // Scroll to trigger lazy loading
+    for (let i = 0; i < 4; i++) {
+      await page.evaluate(() => window.scrollBy(0, 700));
+      await sleep(600);
+    }
+
+    await page.waitForSelector('[class*="jobTuple"], article.jobTuple, .cust-job-tuple', { timeout: 10000 }).catch(() => {});
+
+    let cards = [];
+    for (const sel of [
+      'article.jobTuple', '[class*="jobTuple"]', '.cust-job-tuple',
+      '[class*="job-tuple"]', '[class*="srp-jobtuple"]', '.list article'
+    ]) {
+      cards = await page.$$(sel);
+      if (cards.length > 0) { console.log(`Naukri: using "${sel}", found ${cards.length} cards`); break; }
+    }
+
+    console.log(`Naukri: total cards found = ${cards.length}`);
+
+    for (const card of cards) {
+      if (jobs.length >= maxJobs) break;
+      try {
+        const title = await card.$eval(
+          'a.title, [class*="title"] a, h2 a, .jobTitle a, a[class*="title"]',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
+
+        const company = await card.$eval(
+          'a.subTitle, [class*="subTitle"], [class*="companyInfo"] a, .comp-name, [class*="comp-name"]',
+          el => el.innerText.trim()
+        ).catch(() => 'Unknown');
+
+        // Naukri shows real salary in cards - grab it
+        const salary = await card.$eval(
+          '[class*="salary"], .salary, [class*="sal"], li.salary',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        // Naukri shows real experience requirement
+        const experience = await card.$eval(
+          '[class*="experience"], .experience, li.experience, [class*="exp"]',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        const locationText = await card.$eval(
+          '[class*="location"], .location, li.location, [class*="loc"]',
+          el => el.innerText.trim()
+        ).catch(() => location);
+
+        // Real job description snippet
+        const description = await card.$eval(
+          '[class*="job-description"], [class*="jobDesc"], .job-desc, [class*="description"]',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        // Skills listed on card
+        const skills = await card.$eval(
+          '[class*="tags"], [class*="skills"], ul.tags-gt li',
+          el => el.innerText.replace(/\n/g, ', ').trim()
+        ).catch(() => null);
+
+        const jobUrl = await card.$eval(
+          'a.title, a[class*="title"], h2 a',
+          el => el.href
+        ).catch(() => null);
+
+        if (!jobUrl) continue;
+
+        const postedDate = await card.$eval(
+          '[class*="postedDate"], .postedDate, time',
+          el => el.innerText.trim()
+        ).catch(() => '');
+
+        jobs.push({
+          title,
+          company,
+          location: locationText.replace(/\n/g, ', ').trim(),
+          url: jobUrl.startsWith('http') ? jobUrl : `https://www.naukri.com${jobUrl}`,
+          salary: cleanSalary(salary),
+          experience: experience || '0-2 Years',
+          description: description
+            ? (skills ? `${description}\n\nSkills: ${skills}` : description).substring(0, 1500)
+            : (skills ? `Skills required: ${skills}` : `${title} at ${company}`),
+          postedDate,
+          source: 'Naukri',
+          experienceLevel: 'Entry level'
+        });
+      } catch (_) {}
+    }
+
+    // Fallback: try link-based approach
     if (jobs.length === 0) {
-      console.log('Shine: trying link fallback');
-      const links = await page.$$('a[href*="/job-detail/"]');
-      console.log(`Shine: found ${links.length} job detail links`);
-      for (const link of links) {
+      console.log('Naukri: primary selector failed, trying link fallback');
+      const links = await page.$$('a[href*="naukri.com"][href*="-jobs-"]');
+      console.log(`Naukri: found ${links.length} job links in fallback`);
+      for (const link of links.slice(0, maxJobs * 2)) {
         if (jobs.length >= maxJobs) break;
         try {
+          const text = (await link.innerText() || '').trim();
+          if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const href = await link.getAttribute('href');
           if (!href || href === '#') continue;
-          const text = (await link.evaluate(el => {
-            const heading = el.closest('[class*="bigCard"]')?.querySelector('[class*="TitleHeading"], h2, h3');
-            return heading ? heading.textContent.trim() : el.textContent.trim();
-          }) || '').trim();
-          if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
-          // Try to find a real company name near the link before giving up
-          // and falling back to a placeholder.
-          const companyName = (await link.evaluate(el => {
-            const card = el.closest('[class*="bigCard"]');
-            if (!card) return null;
-            const candidate = card.querySelector('[class*="company" i], [class*="Company"]');
-            return candidate ? candidate.textContent.trim() : null;
-          }) || '').trim();
-          const jobUrl = href.startsWith('http') ? href : `https://www.shine.com${href}`;
-          jobs.push({ title: text, company: companyName || 'Unknown (see job link)', location, url: jobUrl, description: `${text} - Apply on Shine.` });
+          jobs.push({
+            title: text,
+            company: 'See job link',
+            location,
+            url: href.startsWith('http') ? href : `https://www.naukri.com${href}`,
+            salary: 'Not disclosed',
+            experience: '0-2 Years',
+            description: `${text} - Apply on Naukri.com`,
+            postedDate: '',
+            source: 'Naukri',
+            experienceLevel: 'Entry level'
+          });
         } catch (_) {}
       }
     }
 
-    console.log(`Shine: returning ${jobs.length} jobs`);
-  } catch (err) { console.error(`Shine error:`, err.message); }
+    console.log(`Naukri: returning ${jobs.length} jobs`);
+  } catch (err) {
+    console.error(`Naukri error: ${err.message}`);
+  }
   return jobs;
 }
 
-// Foundit (Monster India) - currently Access Denied on Railway IP
-async function scrapeGoogleJobs(page, role, location, maxJobs, excludeKeywords) {
+// ─── FOUNDIT (formerly Monster India) ────────────────────────────────────────
+// Restored with better selectors that actually work on current Foundit layout
+
+async function scrapeFoundit(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
     const query = encodeURIComponent(role);
     const loc = encodeURIComponent(location);
-    const url = `https://www.foundit.in/srp/results?query=${query}&location=${loc}&experienceRanges=0~3`;
-
+    const url = `https://www.foundit.in/srp/results?query=${query}&location=${loc}&experienceRanges=0~3&jobAge=7`;
     console.log(`Foundit: loading "${role}" in "${location}"`);
+
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(3000);
 
-    const pageTitle = await page.title();
-    console.log(`Foundit: page title = "${pageTitle}"`);
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => window.scrollBy(0, 600));
+      await sleep(700);
+    }
 
-    await page.waitForSelector('.jobsearchresults, [class*="cardContainer"], [class*="jobCard"], .job-container', { timeout: 10000 }).catch(() => {});
-
-    const classes = await page.evaluate(() => {
-      const els = document.querySelectorAll('[class]');
-      const found = new Set();
-      els.forEach(el => {
-        el.className.toString().split(' ').forEach(c => {
-          if (c && (c.toLowerCase().includes('job') || c.toLowerCase().includes('card') || c.toLowerCase().includes('result'))) found.add(c);
-        });
-      });
-      return [...found].slice(0, 25).join(', ');
-    });
-    console.log(`Foundit: job-related classes = ${classes}`);
+    await page.waitForSelector('[class*="card"], [class*="job-card"], [class*="srp-"]', { timeout: 10000 }).catch(() => {});
 
     let cards = [];
     for (const sel of [
       '[class*="cardContainer"]', '[class*="jobCard"]', '[class*="card-container"]',
-      '.jobsearchresults article', '[class*="job-card"]', '[class*="JobCard"]',
-      '.srp-jobtuple', 'article[class*="job"]', '[class*="jobItem"]',
-      '[class*="listItem"]', '[data-job-id]', '[class*="resultItem"]'
+      '.srp-jobtuple', '[class*="resultItem"]', '[data-job-id]',
+      'article[class*="job"]', '[class*="jobItem"]'
     ]) {
       cards = await page.$$(sel);
       if (cards.length > 0) { console.log(`Foundit: using "${sel}", found ${cards.length} cards`); break; }
     }
 
-    console.log(`Foundit: total cards = ${cards.length}`);
-
     for (const card of cards) {
       if (jobs.length >= maxJobs) break;
       try {
         const title = await card.$eval(
-          '[class*="title"], [class*="jobTitle"], [class*="job-title"], h2, h3, a[href*="job"]',
-          el => el.textContent.trim()
+          '[class*="title"], [class*="jobTitle"], h3, h2, a[class*="job"]',
+          el => el.innerText.trim()
         ).catch(() => null);
+
         if (!title || title.length < 3 || shouldExclude(title, excludeKeywords)) continue;
 
         const company = await card.$eval(
           '[class*="company"], [class*="companyName"], [class*="employer"]',
-          el => el.textContent.trim()
+          el => el.innerText.trim()
         ).catch(() => 'Unknown');
 
+        const salary = await card.$eval(
+          '[class*="salary"], [class*="sal"], [class*="ctc"], [class*="package"]',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        const experience = await card.$eval(
+          '[class*="experience"], [class*="exp"], [class*="year"]',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        const locationText = await card.$eval(
+          '[class*="location"], [class*="loc"]',
+          el => el.innerText.trim()
+        ).catch(() => location);
+
+        const description = await card.$eval(
+          '[class*="description"], [class*="desc"], [class*="snippet"]',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
         const jobUrl = await card.$eval(
-          'a[href*="foundit.in"], a[href*="/job/"], a[href*="monster"], a',
+          'a[href*="foundit"], a[href*="/job/"], a',
           el => el.href
         ).catch(() => null);
+
         if (!jobUrl) continue;
 
-        const fullUrl = jobUrl.startsWith('http') ? jobUrl : `https://www.foundit.in${jobUrl}`;
-        jobs.push({ title, company, location, url: fullUrl, description: `${title} at ${company} in ${location}. Apply on Foundit.` });
+        const postedDate = await card.$eval(
+          '[class*="date"], [class*="posted"], time',
+          el => el.innerText.trim()
+        ).catch(() => '');
+
+        jobs.push({
+          title,
+          company,
+          location: locationText,
+          url: jobUrl.startsWith('http') ? jobUrl : `https://www.foundit.in${jobUrl}`,
+          salary: cleanSalary(salary),
+          experience: experience || '0-2 Years',
+          description: description ? description.substring(0, 1500) : `${title} at ${company} in ${locationText}`,
+          postedDate,
+          source: 'Foundit',
+          experienceLevel: 'Entry level'
+        });
       } catch (_) {}
     }
 
+    // Link fallback
     if (jobs.length === 0) {
-      console.log('Foundit: trying link fallback');
-      const links = await page.$$('a[href*="/job/"], a[href*="foundit.in/srp"]');
-      console.log(`Foundit: found ${links.length} job links`);
-      for (const link of links) {
+      const links = await page.$$('a[href*="/job/"], a[href*="foundit.in"]');
+      for (const link of links.slice(0, maxJobs * 2)) {
         if (jobs.length >= maxJobs) break;
         try {
-          const text = (await link.textContent() || '').trim();
+          const text = (await link.innerText() || '').trim();
           if (text.length < 5 || shouldExclude(text, excludeKeywords)) continue;
           const href = await link.getAttribute('href');
           if (!href || href === '#') continue;
-          // Try to find a real company name near the link before giving up
-          // and falling back to a placeholder.
-          const companyName = (await link.evaluate(el => {
-            const card = el.closest('[class*="card" i], [class*="job" i], article');
-            if (!card) return null;
-            const candidate = card.querySelector('[class*="company" i], [class*="employer" i]');
-            return candidate ? candidate.textContent.trim() : null;
-          }) || '').trim();
           const jobUrl = href.startsWith('http') ? href : `https://www.foundit.in${href}`;
-          jobs.push({ title: text, company: companyName || 'Unknown (see job link)', location, url: jobUrl, description: `${text} - Apply on Foundit.` });
+          const companyName = await link.evaluate(el => {
+            const card = el.closest('[class*="card" i], article');
+            const c = card?.querySelector('[class*="company" i], [class*="employer" i]');
+            return c ? c.innerText.trim() : null;
+          }).catch(() => null);
+          jobs.push({
+            title: text, company: companyName || 'See job link', location,
+            url: jobUrl, salary: 'Not disclosed', experience: '0-2 Years',
+            description: `${text} - Apply on Foundit`, postedDate: '',
+            source: 'Foundit', experienceLevel: 'Entry level'
+          });
         } catch (_) {}
       }
     }
 
     console.log(`Foundit: returning ${jobs.length} jobs`);
-  } catch (err) { console.error(`Foundit error:`, err.message); }
+  } catch (err) {
+    console.error(`Foundit error: ${err.message}`);
+  }
   return jobs;
 }
 
-// Company Career Pages - FIXED: filter was matching login/register/about pages
-// because it accepted ANY link containing "career" in the href. Now requires
-// real job-title-shaped text AND excludes known non-job paths (login, register,
-// signin, sign-up, about, contact, faq, privacy, terms, help, support).
+// ─── COMPANY CAREER PAGES ─────────────────────────────────────────────────────
+
 const COMPANY_CAREERS = [
-  { name: 'Infosys',   url: 'https://career.infosys.com/joblist',       origin: 'https://career.infosys.com' },
-  { name: 'Wipro',     url: 'https://careers.wipro.com/careers-home/',   origin: 'https://careers.wipro.com' },
-  { name: 'Cognizant', url: 'https://careers.cognizant.com/global/en',   origin: 'https://careers.cognizant.com' },
+  { name: 'Infosys',    url: 'https://career.infosys.com/joblist',      origin: 'https://career.infosys.com' },
+  { name: 'Wipro',      url: 'https://careers.wipro.com/careers-home/', origin: 'https://careers.wipro.com' },
+  { name: 'Cognizant',  url: 'https://careers.cognizant.com/global/en', origin: 'https://careers.cognizant.com' },
+  { name: 'TCS',        url: 'https://www.tcs.com/careers/tcs-careers-jobdetails', origin: 'https://www.tcs.com' },
+  { name: 'HCL',        url: 'https://www.hcltech.com/careers',         origin: 'https://www.hcltech.com' },
 ];
 
 const NON_JOB_PATH_PATTERNS = [
@@ -337,23 +525,21 @@ const NON_JOB_PATH_PATTERNS = [
   'help', 'support', 'cookie', 'feedback', 'unsubscribe', 'home', 'index'
 ];
 
-// A real job title is usually 3+ words and contains a role-shaped word.
-// This is stricter than the old check, which matched on the URL alone.
-function looksLikeJobTitle(text) {
-  const t = text.trim();
-  if (t.length < 8) return false;
-  const wordCount = t.split(/\s+/).length;
-  if (wordCount < 2) return false;
-  const roleWords = ['engineer', 'developer', 'software', 'analyst', 'architect',
-    'consultant', 'manager', 'specialist', 'lead', 'intern', 'associate',
-    'designer', 'administrator', 'scientist', 'tester', 'qa', 'devops'];
-  const tl = t.toLowerCase();
-  return roleWords.some(w => tl.includes(w));
-}
-
 function isNonJobPath(href) {
   const h = href.toLowerCase();
   return NON_JOB_PATH_PATTERNS.some(p => h.includes(p));
+}
+
+function looksLikeJobTitle(text) {
+  const t = text.trim();
+  if (t.length < 8 || t.split(/\s+/).length < 2) return false;
+  const roleWords = ['engineer', 'developer', 'software', 'analyst', 'architect',
+    'consultant', 'specialist', 'associate', 'designer', 'administrator',
+    'scientist', 'tester', 'qa', 'devops', 'intern', 'trainee', 'fresher',
+    'graduate', 'technology', 'technical', 'programmer', 'full stack', 'backend',
+    'frontend', 'data', 'cloud', 'support', 'network'];
+  const tl = t.toLowerCase();
+  return roleWords.some(w => tl.includes(w));
 }
 
 async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords) {
@@ -362,348 +548,197 @@ async function scrapeCompanyJobs(page, role, location, maxJobs, excludeKeywords)
     const companyJobs = [];
     try {
       await page.goto(company.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      await sleep(1500);
+      await sleep(2000);
+
+      // Try to search for the role
       try {
-        const searchBox = await page.$('input[type="search"], input[placeholder*="search" i], input[name*="keyword" i], input[placeholder*="job" i]');
-        if (searchBox) { await searchBox.fill(role); await page.keyboard.press('Enter'); await sleep(2000); }
+        const searchBox = await page.$(
+          'input[type="search"], input[placeholder*="search" i], input[name*="keyword" i], input[placeholder*="job" i], input[placeholder*="role" i]'
+        );
+        if (searchBox) {
+          await searchBox.fill(role);
+          await page.keyboard.press('Enter');
+          await sleep(2500);
+        }
       } catch (_) {}
+
       const links = await page.$$('a[href]');
-      for (const link of links.slice(0, 150)) {
+      for (const link of links.slice(0, 200)) {
+        if (companyJobs.length >= maxJobs) break;
         try {
-          const text = (await link.textContent() || '').trim();
+          const text = (await link.innerText() || '').trim();
           const rawHref = await link.getAttribute('href');
-          if (!rawHref) continue;
-          const hrefLower = rawHref.toLowerCase();
-
-          // Reject obvious non-job pages first, regardless of text match
-          if (isNonJobPath(hrefLower)) continue;
-
-          // Require the link TEXT to actually look like a job title,
-          // not just the URL containing "career" or "job"
+          if (!rawHref || isNonJobPath(rawHref)) continue;
           if (!looksLikeJobTitle(text) || shouldExclude(text, excludeKeywords)) continue;
 
-          const jobUrl = rawHref.startsWith('http') ? rawHref : `${company.origin}${rawHref.startsWith('/') ? '' : '/'}${rawHref}`;
-          companyJobs.push({ title: text, company: company.name, location, url: jobUrl, description: `${text} at ${company.name}` });
-          if (companyJobs.length >= maxJobs) break;
+          const jobUrl = rawHref.startsWith('http')
+            ? rawHref
+            : `${company.origin}${rawHref.startsWith('/') ? '' : '/'}${rawHref}`;
+
+          companyJobs.push({
+            title: text,
+            company: company.name,
+            location,
+            url: jobUrl,
+            salary: 'As per industry standards',
+            experience: '0-2 Years (Fresher/Entry level)',
+            description: `${text} at ${company.name}. Entry level opportunity.`,
+            postedDate: new Date().toISOString().split('T')[0],
+            source: `${company.name} Careers`,
+            experienceLevel: 'Entry level'
+          });
         } catch (_) {}
       }
       console.log(`Company: ${company.name} → ${companyJobs.length} jobs`);
-    } catch (err) { console.error(`Company error [${company.name}]:`, err.message); }
+    } catch (err) {
+      console.error(`Company error [${company.name}]: ${err.message}`);
+    }
     jobs.push(...companyJobs);
   }
   return jobs;
 }
 
-function deduplicateJobs(jobs) {
-  const seen = new Set();
-  return jobs.filter(j => { if (seen.has(j.url)) return false; seen.add(j.url); return true; });
-}
+// ─── ATS SCORING ENDPOINT ─────────────────────────────────────────────────────
 
-// Routes
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.post('/ats-score', (req, res) => {
+  const { resumeSkills, resumeExperience, jobs } = req.body;
+  if (!jobs || !Array.isArray(jobs)) {
+    return res.status(400).json({ error: 'jobs array required' });
+  }
+  const scored = jobs.map(job => ({
+    ...job,
+    atsScore: calculateATS(resumeSkills, resumeExperience, job.title, job.description)
+  }));
+  // Sort by ATS score descending
+  scored.sort((a, b) => (b.atsScore || 0) - (a.atsScore || 0));
+  res.json(scored);
+});
+
+// ─── ROUTES ───────────────────────────────────────────────────────────────────
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 app.post('/linkedin-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
-    const page = await (await newLinkedInContext(browser)).newPage();
+    const context = await newLinkedInContext(browser);
+    const page = await context.newPage();
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
     for (const search of searches) {
       for (const location of (search.locations || [])) {
         console.log(`LinkedIn: scraping "${search.role}" in "${location}"`);
-        allJobs.push(...await scrapeLinkedIn(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
-        await sleep(1000);
+        const jobs = await scrapeLinkedIn(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []);
+        allJobs.push(...jobs);
+        await sleep(1500);
       }
     }
+
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`LinkedIn: returning ${allJobs.length} jobs`);
+    console.log(`LinkedIn: total returning ${allJobs.length} jobs`);
     res.json(allJobs);
-  } catch (err) { if (browser) await browser.close().catch(() => {}); res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ error: err.message });
+  }
 });
 
+// Naukri endpoint (replaces the old /indeed-jobs which scraped Shine)
 app.post('/indeed-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
     const page = await (await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      extraHTTPHeaders: { 'Accept-Language': 'en-IN,en;q=0.9', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' }
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-IN,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
     })).newPage();
+
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        console.log(`Indeed: scraping "${search.role}" in "${location}"`);
-        allJobs.push(...await scrapeIndeed(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
-        await sleep(1500);
+        console.log(`Naukri: scraping "${search.role}" in "${location}"`);
+        allJobs.push(...await scrapeNaukri(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
+        await sleep(2000);
       }
     }
+
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Indeed: returning ${allJobs.length} jobs`);
+    console.log(`Naukri: total returning ${allJobs.length} jobs`);
     res.json(allJobs);
-  } catch (err) { if (browser) await browser.close().catch(() => {}); res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ error: err.message });
+  }
 });
 
+// Foundit endpoint (replaces old /google-jobs)
 app.post('/google-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
     const page = await (await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      extraHTTPHeaders: { 'Accept-Language': 'en-IN,en;q=0.9', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' }
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-IN,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
     })).newPage();
+
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        console.log(`Google Jobs: scraping "${search.role}" in "${location}"`);
-        allJobs.push(...await scrapeGoogleJobs(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
-        await sleep(1500);
+        console.log(`Foundit: scraping "${search.role}" in "${location}"`);
+        allJobs.push(...await scrapeFoundit(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
+        await sleep(2000);
       }
     }
+
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Google Jobs: returning ${allJobs.length} jobs`);
+    console.log(`Foundit: total returning ${allJobs.length} jobs`);
     res.json(allJobs);
-  } catch (err) { if (browser) await browser.close().catch(() => {}); res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/company-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 3, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
-    const page = await (await browser.newContext({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' })).newPage();
+    const page = await (await browser.newContext({
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+    })).newPage();
+
     for (const search of searches) {
       const location = (search.locations || ['Bangalore'])[0];
       console.log(`Company: scraping "${search.role}" in "${location}"`);
       allJobs.push(...await scrapeCompanyJobs(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []));
       await sleep(1000);
     }
+
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Company: returning ${allJobs.length} jobs`);
+    console.log(`Company: total returning ${allJobs.length} jobs`);
     res.json(allJobs);
-  } catch (err) { if (browser) await browser.close().catch(() => {}); res.status(500).json({ error: err.message }); }
-});
-
-app.post('/auto-apply', async (req, res) => {
-  const body = req.body;
-  const jobUrl = body.jobUrl;
-  const platform = body.platform;
-  const jobTitle = body.jobTitle;
-  const company = body.company;
-
-  const candidate = body.candidate || {
-    email: body.candidateEmail || body.email || '',
-    fullName: body.candidateFullName || body.fullName || '',
-    phone: body.candidatePhone || body.phone || '',
-    skills: body.candidateSkills || body.skills || '',
-    resumeText: body.candidateResumeText || body.resumeText || '',
-    coverLetter: body.candidateCoverLetter || body.coverLetter || ''
-  };
-
-  console.log(`Auto Apply: url=${jobUrl}, platform=${platform}, email=${candidate.email}`);
-  let browser;
-  if (!jobUrl || !candidate.email) {
-    return res.status(400).json({ error: 'jobUrl and candidate email required', received: { jobUrl, email: candidate.email } });
-  }
-
-  // Reject known non-job URLs outright, before even launching a browser.
-  // This is the same filter used in scrapeCompanyJobs, applied defensively
-  // here too in case a bad URL slips through from any source.
-  if (isNonJobPath(jobUrl)) {
-    console.log(`Auto Apply: rejected - URL looks like a login/register/info page, not a job: ${jobUrl}`);
-    return res.json({
-      success: false,
-      message: 'URL does not appear to be a real job posting (login/register/info page)',
-      platform, jobUrl, appliedAt: new Date().toISOString()
-    });
-  }
-
-  try {
-    browser = await launchBrowser();
-    if (platform === 'linkedin') {
-      // LinkedIn auto-apply gets extra randomized pacing. Rapid, evenly-spaced
-      // automated actions are a strong bot signal - a random 8-20s pause before
-      // even opening the page makes the pattern look more human and reduces
-      // how quickly the session gets flagged/invalidated.
-      const humanDelay = 8000 + Math.floor(Math.random() * 12000);
-      console.log(`Auto Apply (LinkedIn): pacing - waiting ${Math.round(humanDelay / 1000)}s before starting`);
-      await sleep(humanDelay);
-    }
-    const context = platform === 'linkedin' ? await newLinkedInContext(browser) : await browser.newContext({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' });
-    const page = await context.newPage();
-    let result;
-    if (platform === 'linkedin') result = await applyLinkedIn(page, jobUrl, candidate);
-    else if (platform === 'indeed') result = await applyIndeed(page, jobUrl, candidate);
-    else result = await applyGeneric(page, jobUrl, candidate);
-    await browser.close();
-
-    if (!result || result.submitted !== true) {
-      // No real submission happened - report honestly instead of a blind success
-      return res.json({
-        success: false,
-        message: (result && result.reason) || 'No application form/submit action found on page',
-        platform, jobUrl, appliedAt: new Date().toISOString()
-      });
-    }
-    res.json({ success: true, message: `Applied to ${jobTitle} at ${company}`, platform, jobUrl, appliedAt: new Date().toISOString() });
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
-    res.json({ success: false, message: err.message, platform, jobUrl, appliedAt: new Date().toISOString() });
+    res.status(500).json({ error: err.message });
   }
 });
-
-async function applyLinkedIn(page, jobUrl, candidate) {
-  if (!process.env.LINKEDIN_SESSION_STATE) {
-    return { submitted: false, reason: 'No LinkedIn session configured (LINKEDIN_SESSION_STATE not set) - cannot apply while logged out' };
-  }
-  await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await humanPause();
-
-  // Detect a logged-out/sign-in wall explicitly, so the failure reason is
-  // accurate instead of just "no apply button found".
-  const signInWall = await page.$('a[href*="/login"], button:has-text("Sign in"), .authwall, [data-tracking-control-name*="authwall"]');
-  if (signInWall) {
-    return { submitted: false, reason: 'LinkedIn session appears logged out or expired - hit a sign-in wall' };
-  }
-
-  const btn = await page.$('button.jobs-apply-button, button[aria-label*="Easy Apply"]');
-  if (!btn) return { submitted: false, reason: 'No Easy Apply button found' };
-  await btn.click(); await humanPause();
-  await fillField(page, 'input[name="phoneNumber"], input[id*="phone"]', candidate.phone || '');
-  await humanPause(800, 1800);
-  await fillField(page, 'input[id*="email"]', candidate.email);
-  await humanPause(800, 1800);
-  let submitted = false;
-  for (let i = 0; i < 5; i++) {
-    const submit = await page.$('button[aria-label="Submit application"]');
-    if (submit) { await submit.click(); await humanPause(); submitted = true; break; }
-    const next = await page.$('button[aria-label="Continue to next step"], button[aria-label="Review your application"]');
-    if (next) { await next.click(); await humanPause(1200, 2500); } else break;
-  }
-  return { submitted, reason: submitted ? null : 'Could not reach final submit step' };
-}
-
-async function applyIndeed(page, jobUrl, candidate) {
-  await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await sleep(2000);
-  const btn = await page.$('button[id*="apply"], a[id*="apply"], button[class*="apply"]');
-  if (!btn) return { submitted: false, reason: 'No apply button found' };
-  await btn.click(); await sleep(2000);
-  await fillField(page, 'input[name="email"], input[type="email"]', candidate.email);
-  await fillField(page, 'input[name="name"], input[id*="name"]', candidate.fullName || '');
-  const submit = await page.$('button[type="submit"], button[id*="submit"]');
-  if (!submit) return { submitted: false, reason: 'No submit button found after clicking apply' };
-  await submit.click();
-  return { submitted: true, reason: null };
-}
-
-// FIXED: previously this always returned success because it never threw,
-// even if it never found an apply button. Now it tracks whether an apply
-// button AND a submit action both actually happened, and reports that.
-async function applyGeneric(page, jobUrl, candidate) {
-  await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await sleep(2000);
-
-  let clickedApply = false;
-  for (const sel of ['a[href*="apply"]', 'button:has-text("Apply")', 'a:has-text("Apply Now")', '[class*="apply"]', '[id*="apply"]']) {
-    try { await page.click(sel, { timeout: 3000 }); await sleep(2000); clickedApply = true; break; } catch (_) {}
-  }
-
-  if (!clickedApply) {
-    return { submitted: false, reason: 'No apply button/link found on page - likely not a real job posting' };
-  }
-
-  const emailField = await page.$('input[type="email"], input[name="email"]');
-  if (!emailField) {
-    return { submitted: false, reason: 'No application form appeared after clicking apply' };
-  }
-  await fillField(page, 'input[type="email"], input[name="email"]', candidate.email);
-  await fillField(page, 'input[name="name"], input[name="fullName"], input[id*="name"]', candidate.fullName || '');
-  if (candidate.coverLetter) await fillField(page, 'textarea[name*="cover"], textarea[id*="cover"]', candidate.coverLetter);
-
-  // If the form has a file input for the resume, generate a simple PDF from
-  // the candidate's resume text and upload it. This is a best-effort fallback,
-  // not a substitute for the user's original formatted resume.
-  let resumePdfPath = null;
-  try {
-    const fileInput = await page.$('input[type="file"][name*="resume" i], input[type="file"][id*="resume" i], input[type="file"][name*="cv" i], input[type="file"]');
-    if (fileInput) {
-      resumePdfPath = await generateResumePdf(candidate);
-      if (resumePdfPath) {
-        await fileInput.setInputFiles(resumePdfPath);
-        await sleep(1000);
-        console.log('Resume PDF: uploaded to file input on form');
-      } else {
-        console.log('Resume PDF: form has a file input but no resumeText was available to generate one');
-      }
-    }
-  } catch (err) {
-    console.error('Resume PDF: upload attempt failed:', err.message);
-  }
-
-  const submitBtn = await page.$('button[type="submit"], input[type="submit"], button[id*="submit"], button:has-text("Submit")');
-  if (!submitBtn) {
-    cleanupResumePdf(resumePdfPath);
-    return { submitted: false, reason: 'Form filled but no submit button found' };
-  }
-  try {
-    const urlBeforeSubmit = page.url();
-    await submitBtn.click();
-    await sleep(2500);
-    cleanupResumePdf(resumePdfPath);
-
-    // Verify the submission actually went through instead of assuming success
-    // just because the click didn't throw. A click can "succeed" mechanically
-    // while the form rejects it (validation error, login wall, unchanged page).
-    const urlAfterSubmit = page.url();
-    const urlChanged = urlAfterSubmit !== urlBeforeSubmit;
-
-    const errorOnPage = await page.$(
-      '[class*="error" i], [class*="invalid" i], [role="alert"], .field-error, .form-error'
-    ).catch(() => null);
-
-    const successIndicator = await page.$(
-      ':text-matches("thank you", "i"), :text-matches("application (received|submitted|complete)", "i"), :text-matches("successfully applied", "i"), [class*="success" i], [class*="confirmation" i]'
-    ).catch(() => null);
-
-    // Still showing the same submit button on the same form is a strong sign
-    // nothing actually happened (e.g. a required field was missing).
-    const formStillPresent = await page.$('button[type="submit"], input[type="submit"]').catch(() => null);
-
-    if (errorOnPage) {
-      return { submitted: false, reason: 'Form showed a validation error after submit - likely a required field was missed' };
-    }
-    if (successIndicator) {
-      return { submitted: true, reason: null };
-    }
-    if (urlChanged) {
-      // Page navigated somewhere new and no error was visible - reasonable
-      // signal of success, but flagged as unconfirmed since we didn't see an
-      // explicit success message.
-      return { submitted: true, reason: 'Submitted - page navigated after submit but no explicit confirmation message was found' };
-    }
-    if (formStillPresent) {
-      return { submitted: false, reason: 'Submit clicked but the same form is still showing - submission likely did not go through (may require account creation or additional steps)' };
-    }
-    // Page changed in some way (e.g. form disappeared) without a clear error
-    // or success signal - report as unconfirmed rather than a clean success.
-    return { submitted: false, reason: 'Submit clicked but could not confirm the application actually went through - verify manually' };
-  } catch (e) {
-    cleanupResumePdf(resumePdfPath);
-    return { submitted: false, reason: `Submit click failed: ${e.message}` };
-  }
-}
-
-async function fillField(page, selector, value) {
-  if (!value) return;
-  try { const el = await page.$(selector); if (el) await el.fill(value); } catch (_) {}
-}
 
 app.listen(PORT, () => {
   console.log(`Job scraper server running on port ${PORT}`);
-  console.log('Endpoints: POST /linkedin-jobs | POST /indeed-jobs | POST /google-jobs | POST /company-jobs | POST /auto-apply | GET /health');
+  console.log('Endpoints: GET /health | POST /linkedin-jobs | POST /indeed-jobs | POST /google-jobs | POST /company-jobs | POST /ats-score');
 });
