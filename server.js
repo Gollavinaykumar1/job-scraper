@@ -1,9 +1,62 @@
 const express = require('express');
 const { chromium } = require('playwright');
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
 const PORT = process.env.PORT || 3000;
+
+// Generates a simple, plain PDF resume from the candidate's resume text and
+// saves it to a temp file. Used to give applyGeneric something real to
+// upload when a job form has a file input for the resume. This is NOT a
+// substitute for the user's original formatted PDF - it's a plain text
+// rendering, used only so automated forms that require a file don't fail
+// outright. Returns the absolute file path, or null on failure.
+async function generateResumePdf(candidate) {
+  const text = (candidate.resumeText || '').trim();
+  if (!text) {
+    console.log('Resume PDF: no resumeText available, skipping generation');
+    return null;
+  }
+  try {
+    const tmpPath = path.join(os.tmpdir(), `resume-${Date.now()}.pdf`);
+    const doc = new PDFDocument({ margin: 50 });
+    const writeStream = fs.createWriteStream(tmpPath);
+    doc.pipe(writeStream);
+
+    doc.fontSize(16).text(candidate.fullName || 'Resume', { underline: true });
+    doc.moveDown(0.5);
+    if (candidate.email) doc.fontSize(10).text(`Email: ${candidate.email}`);
+    if (candidate.phone) doc.fontSize(10).text(`Phone: ${candidate.phone}`);
+    doc.moveDown(1);
+    doc.fontSize(11).text(text, { align: 'left' });
+
+    doc.end();
+
+    await new Promise((resolve, reject) => {
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
+    });
+
+    console.log(`Resume PDF: generated at ${tmpPath}`);
+    return tmpPath;
+  } catch (err) {
+    console.error('Resume PDF: generation failed:', err.message);
+    return null;
+  }
+}
+
+// Deletes a generated resume PDF after it's been used, so temp files don't
+// pile up across runs.
+function cleanupResumePdf(filePath) {
+  if (!filePath) return;
+  fs.unlink(filePath, (err) => {
+    if (err) console.error('Resume PDF: cleanup failed:', err.message);
+  });
+}
 
 async function launchBrowser() {
   return await chromium.launch({
@@ -20,6 +73,35 @@ function shouldExclude(title, excludeKeywords = []) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Loads the saved LinkedIn session (cookies + localStorage) from the
+// LINKEDIN_SESSION_STATE environment variable, if it's set. Returns null
+// if missing or invalid, so callers can fall back to a logged-out context
+// instead of crashing.
+function getLinkedInStorageState() {
+  const raw = process.env.LINKEDIN_SESSION_STATE;
+  if (!raw) {
+    console.log('LinkedIn: no LINKEDIN_SESSION_STATE set, using logged-out session');
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    console.log('LinkedIn: loaded saved session from LINKEDIN_SESSION_STATE');
+    return parsed;
+  } catch (err) {
+    console.error('LinkedIn: LINKEDIN_SESSION_STATE is not valid JSON, ignoring it:', err.message);
+    return null;
+  }
+}
+
+// Creates a browser context for LinkedIn, using the saved session if
+// available so requests appear logged-in instead of as a guest.
+async function newLinkedInContext(browser) {
+  const storageState = getLinkedInStorageState();
+  const contextOptions = { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' };
+  if (storageState) contextOptions.storageState = storageState;
+  return await browser.newContext(contextOptions);
+}
 
 // LinkedIn (unchanged - working)
 async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
@@ -301,7 +383,7 @@ app.post('/linkedin-jobs', async (req, res) => {
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
-    const page = await (await browser.newContext({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' })).newPage();
+    const page = await (await newLinkedInContext(browser)).newPage();
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
     for (const search of searches) {
       for (const location of (search.locations || [])) {
@@ -418,7 +500,8 @@ app.post('/auto-apply', async (req, res) => {
 
   try {
     browser = await launchBrowser();
-    const page = await (await browser.newContext({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' })).newPage();
+    const context = platform === 'linkedin' ? await newLinkedInContext(browser) : await browser.newContext({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' });
+    const page = await context.newPage();
     let result;
     if (platform === 'linkedin') result = await applyLinkedIn(page, jobUrl, candidate);
     else if (platform === 'indeed') result = await applyIndeed(page, jobUrl, candidate);
@@ -441,8 +524,19 @@ app.post('/auto-apply', async (req, res) => {
 });
 
 async function applyLinkedIn(page, jobUrl, candidate) {
+  if (!process.env.LINKEDIN_SESSION_STATE) {
+    return { submitted: false, reason: 'No LinkedIn session configured (LINKEDIN_SESSION_STATE not set) - cannot apply while logged out' };
+  }
   await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000);
+
+  // Detect a logged-out/sign-in wall explicitly, so the failure reason is
+  // accurate instead of just "no apply button found".
+  const signInWall = await page.$('a[href*="/login"], button:has-text("Sign in"), .authwall, [data-tracking-control-name*="authwall"]');
+  if (signInWall) {
+    return { submitted: false, reason: 'LinkedIn session appears logged out or expired - hit a sign-in wall' };
+  }
+
   const btn = await page.$('button.jobs-apply-button, button[aria-label*="Easy Apply"]');
   if (!btn) return { submitted: false, reason: 'No Easy Apply button found' };
   await btn.click(); await sleep(2000);
@@ -496,15 +590,38 @@ async function applyGeneric(page, jobUrl, candidate) {
   await fillField(page, 'input[name="name"], input[name="fullName"], input[id*="name"]', candidate.fullName || '');
   if (candidate.coverLetter) await fillField(page, 'textarea[name*="cover"], textarea[id*="cover"]', candidate.coverLetter);
 
+  // If the form has a file input for the resume, generate a simple PDF from
+  // the candidate's resume text and upload it. This is a best-effort fallback,
+  // not a substitute for the user's original formatted resume.
+  let resumePdfPath = null;
+  try {
+    const fileInput = await page.$('input[type="file"][name*="resume" i], input[type="file"][id*="resume" i], input[type="file"][name*="cv" i], input[type="file"]');
+    if (fileInput) {
+      resumePdfPath = await generateResumePdf(candidate);
+      if (resumePdfPath) {
+        await fileInput.setInputFiles(resumePdfPath);
+        await sleep(1000);
+        console.log('Resume PDF: uploaded to file input on form');
+      } else {
+        console.log('Resume PDF: form has a file input but no resumeText was available to generate one');
+      }
+    }
+  } catch (err) {
+    console.error('Resume PDF: upload attempt failed:', err.message);
+  }
+
   const submitBtn = await page.$('button[type="submit"], input[type="submit"], button[id*="submit"], button:has-text("Submit")');
   if (!submitBtn) {
+    cleanupResumePdf(resumePdfPath);
     return { submitted: false, reason: 'Form filled but no submit button found' };
   }
   try {
     await submitBtn.click();
     await sleep(2000);
+    cleanupResumePdf(resumePdfPath);
     return { submitted: true, reason: null };
   } catch (e) {
+    cleanupResumePdf(resumePdfPath);
     return { submitted: false, reason: `Submit click failed: ${e.message}` };
   }
 }
