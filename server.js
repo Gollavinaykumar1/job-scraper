@@ -74,6 +74,14 @@ function shouldExclude(title, excludeKeywords = []) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Randomized delay used for LinkedIn interactions specifically, to avoid the
+// perfectly even timing that's a strong signal of automation. Defaults to a
+// 1.5-3s pause; callers can pass a tighter or wider range for specific steps.
+function humanPause(minMs = 1500, maxMs = 3000) {
+  const ms = minMs + Math.floor(Math.random() * (maxMs - minMs));
+  return sleep(ms);
+}
+
 // Loads the saved LinkedIn session (cookies + localStorage) from the
 // LINKEDIN_SESSION_STATE environment variable, if it's set. Returns null
 // if missing or invalid, so callers can fall back to a logged-out context
@@ -500,6 +508,15 @@ app.post('/auto-apply', async (req, res) => {
 
   try {
     browser = await launchBrowser();
+    if (platform === 'linkedin') {
+      // LinkedIn auto-apply gets extra randomized pacing. Rapid, evenly-spaced
+      // automated actions are a strong bot signal - a random 8-20s pause before
+      // even opening the page makes the pattern look more human and reduces
+      // how quickly the session gets flagged/invalidated.
+      const humanDelay = 8000 + Math.floor(Math.random() * 12000);
+      console.log(`Auto Apply (LinkedIn): pacing - waiting ${Math.round(humanDelay / 1000)}s before starting`);
+      await sleep(humanDelay);
+    }
     const context = platform === 'linkedin' ? await newLinkedInContext(browser) : await browser.newContext({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' });
     const page = await context.newPage();
     let result;
@@ -528,7 +545,7 @@ async function applyLinkedIn(page, jobUrl, candidate) {
     return { submitted: false, reason: 'No LinkedIn session configured (LINKEDIN_SESSION_STATE not set) - cannot apply while logged out' };
   }
   await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await sleep(2000);
+  await humanPause();
 
   // Detect a logged-out/sign-in wall explicitly, so the failure reason is
   // accurate instead of just "no apply button found".
@@ -539,15 +556,17 @@ async function applyLinkedIn(page, jobUrl, candidate) {
 
   const btn = await page.$('button.jobs-apply-button, button[aria-label*="Easy Apply"]');
   if (!btn) return { submitted: false, reason: 'No Easy Apply button found' };
-  await btn.click(); await sleep(2000);
+  await btn.click(); await humanPause();
   await fillField(page, 'input[name="phoneNumber"], input[id*="phone"]', candidate.phone || '');
+  await humanPause(800, 1800);
   await fillField(page, 'input[id*="email"]', candidate.email);
+  await humanPause(800, 1800);
   let submitted = false;
   for (let i = 0; i < 5; i++) {
     const submit = await page.$('button[aria-label="Submit application"]');
-    if (submit) { await submit.click(); await sleep(2000); submitted = true; break; }
+    if (submit) { await submit.click(); await humanPause(); submitted = true; break; }
     const next = await page.$('button[aria-label="Continue to next step"], button[aria-label="Review your application"]');
-    if (next) { await next.click(); await sleep(1500); } else break;
+    if (next) { await next.click(); await humanPause(1200, 2500); } else break;
   }
   return { submitted, reason: submitted ? null : 'Could not reach final submit step' };
 }
