@@ -150,6 +150,12 @@ async function scrapeNaukri(page, role, location, maxJobs, excludeKeywords) {
     const response = await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
     const text = await page.evaluate(() => document.body.innerText);
 
+    // DEBUG: log raw API response status + sample
+    const apiStatus = response ? response.status() : 0;
+    console.log('NAUKRI_API_DEBUG_STATUS:', apiStatus);
+    console.log('NAUKRI_API_DEBUG_TEXT_LENGTH:', text.length);
+    console.log('NAUKRI_API_DEBUG_TEXT_SAMPLE:', text.substring(0, 1500));
+
     let data;
     try { data = JSON.parse(text); } catch (_) {
       console.log('Naukri API JSON parse failed, trying HTML scrape fallback');
@@ -203,8 +209,18 @@ async function scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords) 
     console.log(`Naukri HTML: loading ${url}`);
 
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-IN,en;q=0.9' });
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const htmlResponse = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(3000);
+
+    // ─── DEBUG BLOCK: tells us exactly what Naukri actually served ───
+    const debugStatus = htmlResponse ? htmlResponse.status() : 0;
+    const debugHTML = await page.content();
+    const debugTitle = await page.title();
+    console.log('NAUKRI_DEBUG_HTTP_STATUS:', debugStatus);
+    console.log('NAUKRI_DEBUG_PAGE_TITLE:', debugTitle);
+    console.log('NAUKRI_DEBUG_HTML_LENGTH:', debugHTML.length);
+    console.log('NAUKRI_DEBUG_HTML_SAMPLE:', debugHTML.substring(0, 2000));
+    // ─── END DEBUG BLOCK ───
 
     for (let i = 0; i < 4; i++) { await page.evaluate(() => window.scrollBy(0, 700)); await sleep(600); }
 
@@ -218,6 +234,8 @@ async function scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords) 
       cards = await page.$$(sel);
       if (cards.length > 0) { console.log(`Naukri HTML: using "${sel}", ${cards.length} cards`); break; }
     }
+
+    console.log('NAUKRI_DEBUG_CARDS_FOUND:', cards.length);
 
     for (const card of cards) {
       if (jobs.length >= maxJobs) break;
