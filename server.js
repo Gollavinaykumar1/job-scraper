@@ -47,6 +47,25 @@ async function randomDelay(min = 1000, max = 3000) {
   return sleep(Math.floor(Math.random() * (max - min) + min));
 }
 
+// Applies basic stealth patches to a browser context to reduce headless-browser
+// fingerprinting signals (navigator.webdriver, plugin list, chrome object, etc.)
+// This is free — no proxy service — and improves odds against basic bot checks,
+// but will NOT reliably bypass full Cloudflare/Akamai challenge pages.
+async function applyStealth(context) {
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    window.chrome = { runtime: {} };
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+      parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters)
+    );
+  });
+}
+
 // ─── LINKEDIN ─────────────────────────────────────────────────────────────────
 
 function getLinkedInStorageState() {
@@ -491,7 +510,103 @@ async function scrapeFoundit(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-// ─── COMPANY CAREER PAGES ─────────────────────────────────────────────────────
+// ─── INDEED ───────────────────────────────────────────────────────────────────
+// Real Indeed.com scraper. Indeed uses Cloudflare bot protection — this uses
+// free stealth patches only (no paid proxy). May get blocked; debug logging
+// included so failures are diagnosable instead of guessed at.
+
+async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
+  const jobs = [];
+  try {
+    const query = encodeURIComponent(role);
+    const loc = encodeURIComponent(location + ', India');
+    const url = `https://in.indeed.com/jobs?q=${query}&l=${loc}&fromage=7&explvl=entry_level`;
+    console.log(`Indeed: loading "${role}" in "${location}"`);
+
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const status = response ? response.status() : 0;
+    await sleep(2500);
+
+    const debugTitle = await page.title();
+    const debugHTML = await page.content();
+    console.log('INDEED_DEBUG_HTTP_STATUS:', status);
+    console.log('INDEED_DEBUG_PAGE_TITLE:', debugTitle);
+    console.log('INDEED_DEBUG_HTML_LENGTH:', debugHTML.length);
+    console.log('INDEED_DEBUG_HTML_SAMPLE:', debugHTML.substring(0, 1500));
+
+    if (status === 403 || status === 429 || /cloudflare|verify you are human|additional verification/i.test(debugTitle + debugHTML.substring(0, 2000))) {
+      console.log('Indeed: blocked by anti-bot protection (Cloudflare)');
+      return jobs;
+    }
+
+    for (let i = 0; i < 4; i++) { await page.evaluate(() => window.scrollBy(0, 700)); await sleep(600); }
+
+    let cards = [];
+    for (const sel of [
+      '.job_seen_beacon', '[data-jk]', '[class*="jobsearch-SerpJobCard"]',
+      '[class*="result"]', 'td.resultContent', '.cardOutline'
+    ]) {
+      cards = await page.$$(sel);
+      if (cards.length > 0) { console.log(`Indeed: using "${sel}", ${cards.length} cards`); break; }
+    }
+    console.log('INDEED_DEBUG_CARDS_FOUND:', cards.length);
+
+    for (const card of cards) {
+      if (jobs.length >= maxJobs) break;
+      try {
+        const title = await card.$eval(
+          'h2.jobTitle span, [class*="jobTitle"] span, h2 a span, .jcs-JobTitle',
+          el => el.innerText.trim()
+        ).catch(() => null);
+        if (!title || shouldExclude(title, excludeKeywords)) continue;
+
+        const company = await card.$eval(
+          '[data-testid="company-name"], .companyName, [class*="company"]',
+          el => el.innerText.trim()
+        ).catch(() => 'Unknown');
+
+        const locationText = await card.$eval(
+          '[data-testid="text-location"], .companyLocation, [class*="location"]',
+          el => el.innerText.trim()
+        ).catch(() => location);
+
+        const salary = await card.$eval(
+          '[class*="salary"], .salary-snippet',
+          el => el.innerText.trim()
+        ).catch(() => null);
+
+        const jobUrl = await card.$eval(
+          'h2.jobTitle a, a[id^="job_"], a[data-jk]',
+          el => el.href
+        ).catch(() => null);
+        if (!jobUrl) continue;
+
+        const snippet = await card.$eval(
+          '[class*="jobSnippet"], .job-snippet',
+          el => el.innerText.trim()
+        ).catch(() => '');
+
+        jobs.push({
+          title, company,
+          location: locationText,
+          url: jobUrl.startsWith('http') ? jobUrl : `https://in.indeed.com${jobUrl}`,
+          salary: cleanSalary(salary),
+          experience: '0-2 Years',
+          description: snippet || `${title} at ${company} in ${locationText}`,
+          postedDate: new Date().toISOString(),
+          source: 'Indeed',
+          experienceLevel: 'Entry level'
+        });
+      } catch (_) {}
+    }
+    console.log(`Indeed: returning ${jobs.length} jobs`);
+  } catch (err) {
+    console.error(`Indeed error: ${err.message}`);
+  }
+  return jobs;
+}
+
+
 
 const COMPANY_CAREERS = [
   { name: 'Infosys', url: 'https://career.infosys.com/joblist', origin: 'https://career.infosys.com' },
@@ -609,21 +724,25 @@ app.post('/indeed-jobs', async (req, res) => {
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
-    const page = await (await browser.newContext({
+    const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      extraHTTPHeaders: { 'Accept-Language': 'en-IN,en;q=0.9' }
-    })).newPage();
+      extraHTTPHeaders: { 'Accept-Language': 'en-IN,en;q=0.9' },
+      viewport: { width: 1280, height: 800 },
+      locale: 'en-IN'
+    });
+    await applyStealth(context);
+    const page = await context.newPage();
 
     for (const search of searches) {
       for (const location of (search.locations || [])) {
-        const jobs = await scrapeNaukri(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []);
+        const jobs = await scrapeIndeed(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []);
         allJobs.push(...jobs);
-        await randomDelay(2000, 4000);
+        await randomDelay(2500, 4500);
       }
     }
     await browser.close();
     allJobs = deduplicateJobs(allJobs);
-    console.log(`Naukri total: ${allJobs.length}`);
+    console.log(`Indeed total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
