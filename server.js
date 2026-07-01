@@ -47,10 +47,6 @@ async function randomDelay(min = 1000, max = 3000) {
   return sleep(Math.floor(Math.random() * (max - min) + min));
 }
 
-// Applies basic stealth patches to a browser context to reduce headless-browser
-// fingerprinting signals (navigator.webdriver, plugin list, chrome object, etc.)
-// This is free — no proxy service — and improves odds against basic bot checks,
-// but will NOT reliably bypass full Cloudflare/Akamai challenge pages.
 async function applyStealth(context) {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -77,7 +73,7 @@ function getLinkedInStorageState() {
 async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(role)}&location=${encodeURIComponent(location)}&f_TPR=r604800&f_E=2%2C3&sortBy=DD`;
+    const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(role)}&location=${encodeURIComponent(location)}&f_TPR=r604800&f_E=1%2C2&sortBy=DD`;
     console.log(`LinkedIn: loading "${role}" in "${location}"`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(2500);
@@ -147,36 +143,55 @@ async function scrapeLinkedIn(page, role, location, maxJobs, excludeKeywords) {
 }
 
 // ─── NAUKRI ───────────────────────────────────────────────────────────────────
-// Uses the Naukri JSON API directly — no scraping, no blocks
+// FIX: warm up a real session on naukri.com first, then call the API via
+// in-page fetch() (not a cold page.goto to the raw API URL) so cookies,
+// Origin and Referer are sent the same way the real site sends them.
+// Also added the missing 'clientid' header that Naukri's API expects.
 
 async function scrapeNaukri(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
   try {
-    // Naukri has a public search API used by their own site
     const query = encodeURIComponent(role);
     const loc = encodeURIComponent(location);
-    const apiUrl = `https://www.naukri.com/jobapi/v3/search?noOfResults=${maxJobs * 2}&urlType=search_by_keyword&searchType=adv&keyword=${query}&location=${loc}&experience=0&jobAge=7&src=jobsearchDesk&pageNo=1`;
 
-    console.log(`Naukri API: fetching "${role}" in "${location}"`);
-
-    await page.setExtraHTTPHeaders({
-      'Accept': 'application/json',
-      'appid': '109',
-      'systemid': 'Naukri',
-      'Referer': 'https://www.naukri.com/',
+    const roleSlug = role.toLowerCase().replace(/\s+/g, '-');
+    const locSlug = location.toLowerCase().replace(/\s+/g, '-');
+    const warmupUrl = `https://www.naukri.com/${roleSlug}-jobs-in-${locSlug}`;
+    console.log(`Naukri: warming up session via ${warmupUrl}`);
+    await page.goto(warmupUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => {
+      console.log('Naukri warmup navigation error (continuing anyway):', e.message);
     });
+    await sleep(2000);
 
-    const response = await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    const text = await page.evaluate(() => document.body.innerText);
+    const apiUrl = `https://www.naukri.com/jobapi/v3/search?noOfResults=${maxJobs * 2}&urlType=search_by_keyword&searchType=adv&keyword=${query}&location=${loc}&experience=0&jobAge=7&src=jobsearchDesk&pageNo=1`;
+    console.log(`Naukri API (in-page fetch): "${role}" in "${location}"`);
 
-    // DEBUG: log raw API response status + sample
-    const apiStatus = response ? response.status() : 0;
-    console.log('NAUKRI_API_DEBUG_STATUS:', apiStatus);
-    console.log('NAUKRI_API_DEBUG_TEXT_LENGTH:', text.length);
-    console.log('NAUKRI_API_DEBUG_TEXT_SAMPLE:', text.substring(0, 1500));
+    const result = await page.evaluate(async (url) => {
+      try {
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json',
+            'appid': '109',
+            'systemid': 'Naukri',
+            'clientid': 'd3skt0p',
+          },
+          credentials: 'include'
+        });
+        const text = await res.text();
+        return { status: res.status, text };
+      } catch (e) {
+        return { status: 0, text: '', error: e.message };
+      }
+    }, apiUrl);
+
+    console.log('NAUKRI_API_DEBUG_STATUS:', result.status);
+    console.log('NAUKRI_API_DEBUG_TEXT_LENGTH:', (result.text || '').length);
+    console.log('NAUKRI_API_DEBUG_TEXT_SAMPLE:', (result.text || '').substring(0, 1500));
+    if (result.error) console.log('NAUKRI_API_DEBUG_FETCH_ERROR:', result.error);
 
     let data;
-    try { data = JSON.parse(text); } catch (_) {
+    try { data = JSON.parse(result.text); } catch (_) {
       console.log('Naukri API JSON parse failed, trying HTML scrape fallback');
       return await scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords);
     }
@@ -231,7 +246,6 @@ async function scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords) 
     const htmlResponse = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(3000);
 
-    // ─── DEBUG BLOCK: tells us exactly what Naukri actually served ───
     const debugStatus = htmlResponse ? htmlResponse.status() : 0;
     const debugHTML = await page.content();
     const debugTitle = await page.title();
@@ -239,11 +253,9 @@ async function scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords) 
     console.log('NAUKRI_DEBUG_PAGE_TITLE:', debugTitle);
     console.log('NAUKRI_DEBUG_HTML_LENGTH:', debugHTML.length);
     console.log('NAUKRI_DEBUG_HTML_SAMPLE:', debugHTML.substring(0, 2000));
-    // ─── END DEBUG BLOCK ───
 
     for (let i = 0; i < 4; i++) { await page.evaluate(() => window.scrollBy(0, 700)); await sleep(600); }
 
-    // Try multiple selectors for Naukri's changing layout
     let cards = [];
     for (const sel of [
       '[class*="srp-jobtuple-wrapper"]', '[class*="jobTuple"]',
@@ -312,7 +324,6 @@ async function scrapeNaukriHTML(page, role, location, maxJobs, excludeKeywords) 
 }
 
 // ─── INTERNSHALA (replaces Foundit which 403s) ────────────────────────────────
-// Internshala is extremely scraping-friendly and has real entry-level jobs
 
 async function scrapeInternshala(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
@@ -390,7 +401,6 @@ async function scrapeInternshala(page, role, location, maxJobs, excludeKeywords)
       } catch (_) {}
     }
 
-    // Fallback: grab job links directly
     if (jobs.length === 0) {
       console.log('Internshala: trying link fallback');
       const links = await page.$$('a[href*="/jobs/detail/"], a[href*="internshala.com/jobs/"]');
@@ -511,9 +521,6 @@ async function scrapeFoundit(page, role, location, maxJobs, excludeKeywords) {
 }
 
 // ─── INDEED ───────────────────────────────────────────────────────────────────
-// Real Indeed.com scraper. Indeed uses Cloudflare bot protection — this uses
-// free stealth patches only (no paid proxy). May get blocked; debug logging
-// included so failures are diagnosable instead of guessed at.
 
 async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   const jobs = [];
@@ -606,8 +613,6 @@ async function scrapeIndeed(page, role, location, maxJobs, excludeKeywords) {
   return jobs;
 }
 
-
-
 const COMPANY_CAREERS = [
   { name: 'Infosys', url: 'https://career.infosys.com/joblist', origin: 'https://career.infosys.com' },
   { name: 'Wipro', url: 'https://careers.wipro.com/careers-home/', origin: 'https://careers.wipro.com' },
@@ -688,7 +693,7 @@ app.get('/health', (req, res) => {
 // ─── LINKEDIN ─────────────────────────────────────────────────────────────────
 
 app.post('/linkedin-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 25, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
@@ -708,7 +713,7 @@ app.post('/linkedin-jobs', async (req, res) => {
       }
     }
     await browser.close();
-    allJobs = deduplicateJobs(allJobs);
+    allJobs = deduplicateJobs(allJobs).slice(0, 25);
     console.log(`LinkedIn total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
@@ -720,7 +725,7 @@ app.post('/linkedin-jobs', async (req, res) => {
 // ─── NAUKRI (real route — calls the actual scrapeNaukri function) ────────────
 
 app.post('/naukri-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 25, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
@@ -741,7 +746,7 @@ app.post('/naukri-jobs', async (req, res) => {
       }
     }
     await browser.close();
-    allJobs = deduplicateJobs(allJobs);
+    allJobs = deduplicateJobs(allJobs).slice(0, 25);
     console.log(`Naukri total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
@@ -753,7 +758,7 @@ app.post('/naukri-jobs', async (req, res) => {
 // ─── INDEED (kept as its own real endpoint too, in case you want it back) ────
 
 app.post('/indeed-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 25, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
@@ -774,7 +779,7 @@ app.post('/indeed-jobs', async (req, res) => {
       }
     }
     await browser.close();
-    allJobs = deduplicateJobs(allJobs);
+    allJobs = deduplicateJobs(allJobs).slice(0, 25);
     console.log(`Indeed total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
@@ -786,7 +791,7 @@ app.post('/indeed-jobs', async (req, res) => {
 // ─── FOUNDIT + INTERNSHALA fallback (/google-jobs endpoint kept same) ─────────
 
 app.post('/google-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 25, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
@@ -803,7 +808,7 @@ app.post('/google-jobs', async (req, res) => {
       }
     }
     await browser.close();
-    allJobs = deduplicateJobs(allJobs);
+    allJobs = deduplicateJobs(allJobs).slice(0, 25);
     console.log(`Foundit/Internshala total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
@@ -815,7 +820,7 @@ app.post('/google-jobs', async (req, res) => {
 // ─── COMPANY CAREERS ──────────────────────────────────────────────────────────
 
 app.post('/company-jobs', async (req, res) => {
-  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  const { searches = [], maxJobsPerSearch = 25, filters = {} } = req.body;
   let allJobs = [], browser;
   try {
     browser = await launchBrowser();
@@ -829,7 +834,7 @@ app.post('/company-jobs', async (req, res) => {
       await sleep(1000);
     }
     await browser.close();
-    allJobs = deduplicateJobs(allJobs);
+    allJobs = deduplicateJobs(allJobs).slice(0, 25);
     console.log(`Company total: ${allJobs.length}`);
     res.json(allJobs);
   } catch (err) {
