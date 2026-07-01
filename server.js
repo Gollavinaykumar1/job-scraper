@@ -717,7 +717,40 @@ app.post('/linkedin-jobs', async (req, res) => {
   }
 });
 
-// ─── NAUKRI (/indeed-jobs endpoint kept same so n8n workflow doesn't break) ───
+// ─── NAUKRI (real route — calls the actual scrapeNaukri function) ────────────
+
+app.post('/naukri-jobs', async (req, res) => {
+  const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
+  let allJobs = [], browser;
+  try {
+    browser = await launchBrowser();
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      extraHTTPHeaders: { 'Accept-Language': 'en-IN,en;q=0.9' },
+      viewport: { width: 1280, height: 800 },
+      locale: 'en-IN'
+    });
+    await applyStealth(context);
+    const page = await context.newPage();
+
+    for (const search of searches) {
+      for (const location of (search.locations || [])) {
+        const jobs = await scrapeNaukri(page, search.role, location, maxJobsPerSearch, filters.excludeKeywords || []);
+        allJobs.push(...jobs);
+        await randomDelay(2500, 4500);
+      }
+    }
+    await browser.close();
+    allJobs = deduplicateJobs(allJobs);
+    console.log(`Naukri total: ${allJobs.length}`);
+    res.json(allJobs);
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── INDEED (kept as its own real endpoint too, in case you want it back) ────
 
 app.post('/indeed-jobs', async (req, res) => {
   const { searches = [], maxJobsPerSearch = 5, filters = {} } = req.body;
@@ -807,5 +840,5 @@ app.post('/company-jobs', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log('Endpoints: /health | /linkedin-jobs | /indeed-jobs | /google-jobs | /company-jobs');
+  console.log('Endpoints: /health | /linkedin-jobs | /naukri-jobs | /indeed-jobs | /google-jobs | /company-jobs');
 });
